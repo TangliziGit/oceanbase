@@ -999,6 +999,7 @@ int ObLoadDataDirect::do_load()
             break;
           }
         } else if (OB_FAIL(row_caster_.get_casted_row(*new_row, datum_row))) {
+          // Cost: 19.37%
           LOG_WARN("fail to cast row", KR(ret));
         } else if (OB_FAIL(external_sort_.append_row(*datum_row))) {
           LOG_WARN("fail to append row", KR(ret));
@@ -1020,6 +1021,7 @@ int ObLoadDataDirect::do_load()
         break;
       }
     } else if (OB_FAIL(sstable_writer_.append_row(*datum_row))) {
+      // Cost: 28.44%
       LOG_WARN("fail to append row", KR(ret));
     }
   }

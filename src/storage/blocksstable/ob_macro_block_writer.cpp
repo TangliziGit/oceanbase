@@ -418,6 +418,7 @@ int ObMacroBlockWriter::append_row(const ObDatumRow &row, const int64_t split_si
           ret = OB_NOT_SUPPORTED;
           STORAGE_LOG(ERROR, "The single row is too large, ", K(ret), K(row));
         } else if (OB_FAIL(build_micro_block())) {
+          // Cost: 20.69%
           STORAGE_LOG(WARN, "Fail to build micro block, ", K(ret));
         } else if (OB_FAIL(micro_writer_->append_row(*row_to_append))) {
           STORAGE_LOG(ERROR, "Fail to append row to micro block, ", K(ret), K(row));
@@ -755,10 +756,12 @@ int ObMacroBlockWriter::build_micro_block()
     ret = OB_INNER_STAT_ERROR;
     STORAGE_LOG(WARN, "micro_block_writer is empty", K(ret));
   } else if (OB_FAIL(micro_writer_->build_micro_block_desc(micro_block_desc))) {
+    // Cost: 9%
     STORAGE_LOG(WARN, "failed to build micro block desc", K(ret));
   } else if (FALSE_IT(micro_block_desc.last_rowkey_ = last_key_)) {
   } else if (FALSE_IT(block_size = micro_block_desc.buf_size_)) {
   } else if (OB_FAIL(micro_helper_.compress_encrypt_micro_block(micro_block_desc))) {
+    // Cost: 11%
     micro_writer_->dump_diagnose_info(); // ignore dump error
     STORAGE_LOG(WARN, "failed to compress and encrypt micro block", K(ret), K(micro_block_desc));
   } else {
