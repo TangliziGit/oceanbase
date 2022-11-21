@@ -894,18 +894,6 @@ int ObLoadSSTableWriter::close()
   return ret;
 }
 
-/**
- * ObLoadDataDirect
- */
-
-ObLoadDataDirect::ObLoadDataDirect()
-{
-}
-
-ObLoadDataDirect::~ObLoadDataDirect()
-{
-}
-
 int ObLoadDataDirect::execute(ObExecContext &ctx, ObLoadDataStmt &load_stmt)
 {
   int ret = OB_SUCCESS;
@@ -927,6 +915,15 @@ int ObLoadDataDirect::inner_init(ObLoadDataStmt &load_stmt)
   const uint64_t table_id = load_args.table_id_;
   ObSchemaGetterGuard schema_guard;
   const ObTableSchema *table_schema = nullptr;
+
+  // split parittion
+  std::string partition_directory = "/tmp/oceanbase/" + std::to_string(table_id);
+  if (OB_FAIL(partition_splitter_.init(load_stmt, partition_directory))) {
+    LOG_WARN("fail to init partition splitter", KR(ret));
+  } else if (OB_FAIL(partition_splitter_.split())) {
+    LOG_WARN("fail to split partition", KR(ret));
+  }
+
   if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_tenant_schema_guard(tenant_id,
                                                                                   schema_guard))) {
     LOG_WARN("fail to get tenant schema guard", KR(ret), K(tenant_id));
@@ -938,6 +935,9 @@ int ObLoadDataDirect::inner_init(ObLoadDataStmt &load_stmt)
   } else if (OB_UNLIKELY(table_schema->is_heap_table())) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("not support heap table", KR(ret));
+  }
+  else if (OB_FAIL(partition_reader_.init(partition_directory, 0, PARTITION_NUM))) {
+    LOG_WARN("fail to init partition reader", KR(ret));
   }
   // init csv_parser_
   else if (OB_FAIL(csv_parser_.init(load_stmt.get_data_struct_in_file(), field_or_var_list.count(),
@@ -957,7 +957,7 @@ int ObLoadDataDirect::inner_init(ObLoadDataStmt &load_stmt)
     LOG_WARN("fail to init row caster", KR(ret));
   }
   // init external_sort_
-  else if (OB_FAIL(external_sort_.init(table_schema, MEM_BUFFER_SIZE, FILE_BUFFER_SIZE))) {
+  else if (OB_FAIL(sort_.init(table_schema, MEM_BUFFER_SIZE, FILE_BUFFER_SIZE))) {
     LOG_WARN("fail to init row caster", KR(ret));
   }
   // init sstable_writer_
@@ -970,66 +970,53 @@ int ObLoadDataDirect::inner_init(ObLoadDataStmt &load_stmt)
 int ObLoadDataDirect::do_load()
 {
   int ret = OB_SUCCESS;
-  const ObNewRow *new_row = nullptr;
-  const ObLoadDatumRow *datum_row = nullptr;
+  ObLoadDatumRow *datum_row = nullptr;
+  
+  bool last_round = false;
   while (OB_SUCC(ret)) {
-    if (OB_FAIL(buffer_.squash())) {
-      LOG_WARN("fail to squash buffer", KR(ret));
-    } else if (OB_FAIL(file_reader_.read_next_buffer(buffer_))) {
-      if (OB_UNLIKELY(OB_ITER_END != ret)) {
-        LOG_WARN("fail to read next buffer", KR(ret));
-      } else {
-        if (OB_UNLIKELY(!buffer_.empty())) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("unexpected incomplate data", KR(ret));
+    sort_.reuse();
+    while (OB_SUCC(ret)) {
+      if (OB_FAIL(partition_reader_.read(datum_row))) {
+        if (ret == OB_EMPTY_RANGE) {
+          // all rows in this partition has been read
+          break;
+        } else if (ret == OB_ITER_END) {
+          // all partitions have been read
+          // TODO
+          last_round = true;
+          break;
+        } else {
+          LOG_WARN("fail to read partition row");
         }
-        ret = OB_SUCCESS;
-        break;
-      }
-    } else if (OB_UNLIKELY(buffer_.empty())) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected empty buffer", KR(ret));
-    } else {
-      while (OB_SUCC(ret)) {
-        if (OB_FAIL(csv_parser_.get_next_row(buffer_, new_row))) {
-          if (OB_UNLIKELY(OB_ITER_END != ret)) {
-            LOG_WARN("fail to get next row", KR(ret));
-          } else {
-            ret = OB_SUCCESS;
-            break;
-          }
-        } else if (OB_FAIL(row_caster_.get_casted_row(*new_row, datum_row))) {
-          // Cost: 19.37%
-          LOG_WARN("fail to cast row", KR(ret));
-        } else if (OB_FAIL(external_sort_.append_row(*datum_row))) {
-          LOG_WARN("fail to append row", KR(ret));
-        }
+      } else if (OB_FAIL(sort_.append_row(datum_row))) {
+        LOG_WARN("fail to append row", KR(ret));
       }
     }
-  }
-  if (OB_SUCC(ret)) {
-    if (OB_FAIL(external_sort_.close())) {
+
+    if (OB_FAIL(sort_.close())) {
       LOG_WARN("fail to close external sort", KR(ret));
     }
-  }
-  while (OB_SUCC(ret)) {
-    if (OB_FAIL(external_sort_.get_next_row(datum_row))) {
-      if (OB_UNLIKELY(OB_ITER_END != ret)) {
-        LOG_WARN("fail to get next row", KR(ret));
-      } else {
-        ret = OB_SUCCESS;
-        break;
+
+    while (OB_SUCC(ret)) {
+      if (OB_FAIL(sort_.get_next_row(datum_row))) {
+        if (OB_UNLIKELY(OB_ITER_END != ret)) {
+          LOG_WARN("fail to get next row", KR(ret));
+        } else {
+          ret = OB_SUCCESS;
+          break;
+        }
+      } else if (OB_FAIL(sstable_writer_.append_row(*datum_row))) {
+        LOG_WARN("fail to append row", KR(ret));
       }
-    } else if (OB_FAIL(sstable_writer_.append_row(*datum_row))) {
-      // Cost: 28.44%
-      LOG_WARN("fail to append row", KR(ret));
     }
   }
+  
   if (OB_SUCC(ret)) {
     if (OB_FAIL(sstable_writer_.close())) {
       LOG_WARN("fail to close sstable writer", KR(ret));
     }
   }
+
   return ret;
 }
 

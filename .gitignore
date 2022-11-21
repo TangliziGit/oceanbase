@@ -333,3 +333,6 @@ deps/3rd
 ############# test #############
 test/tmp
 test/var
+
+.clion.source.upload.marker
+cmake-build-debug-oceanbase/

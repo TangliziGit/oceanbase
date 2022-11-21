@@ -1492,6 +1492,7 @@ int ObMemorySortRound<T, Compare>::add_item(const T &item)
     STORAGE_LOG(WARN, "invalid item size, must not larger than buf memory limit",
         K(ret), K(item_size), K(buf_mem_limit_));
   } else if (allocator_.used() + item_size > buf_mem_limit_ && OB_FAIL(build_fragment())) {
+    // build_fragment(): Cost 12.5%
     STORAGE_LOG(WARN, "fail to build fragment", K(ret));
   } else if (OB_ISNULL(buf = static_cast<char *>(allocator_.alloc(item_size)))) {
     ret = common::OB_ALLOCATE_MEMORY_FAILED;

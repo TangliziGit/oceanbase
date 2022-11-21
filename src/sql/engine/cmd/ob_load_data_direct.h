@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "fstream"
 #include "lib/file/ob_file.h"
 #include "lib/timezone/ob_timezone_info.h"
 #include "sql/engine/cmd/ob_load_data_impl.h"
@@ -193,25 +194,322 @@ private:
   bool is_inited_;
 };
 
-class ObLoadDataDirect : public ObLoadDataBase
+
+static constexpr int64_t PARTITION_NUM = 40;
+static constexpr int64_t PK_MIN = 1;
+static constexpr int64_t PK_MAX = 300000000;
+static constexpr int64_t PK_SPAN = (PK_MAX - PK_MIN + 1) / PARTITION_NUM;
+
+// TODO: data sketch
+// TODO: parallel optimize
+class ObPartitionWriter
 {
-  static const int64_t MEM_BUFFER_SIZE = (1LL << 30); // 1G
-  static const int64_t FILE_BUFFER_SIZE = (2LL << 20); // 2M
 public:
-  ObLoadDataDirect();
-  virtual ~ObLoadDataDirect();
-  int execute(ObExecContext &ctx, ObLoadDataStmt &load_stmt) override;
+  ObPartitionWriter() {}
+
+  int init(const std::string& partition_directory) {
+    partition_directory_ = partition_directory;
+    return OB_SUCCESS;
+  }
+
+  static int64_t gen_key(int64_t pk) {
+    return (pk - PK_MIN) / PK_SPAN;
+  }
+
+  int append_row(const ObLoadDatumRow *&datum_row) {
+    // TODO: select pk via StorageDatumUtils
+    int64_t key = gen_key(datum_row->datums_[0].get_int());
+    char buf[1024];
+    int64_t pos = 0;
+
+    std::ofstream fout;
+    fout.open(partition_directory_ + "/" + std::to_string(key), std::ios_base::app);
+    datum_row->serialize(buf, 1024, pos);
+    fout.write(buf, pos);
+    return OB_SUCCESS;
+  }
 private:
-  int inner_init(ObLoadDataStmt &load_stmt);
-  int do_load();
+  std::string partition_directory_;
+};
+
+// TODO: parallel optimize
+class ObPartitionReader
+{
+public:
+  ObPartitionReader() {}
+
+  // read partitions includes [range_min, range_max]
+  int init(std::string partition_directory, int64_t range_min, int64_t range_max) {
+    partition_directory_ = partition_directory;
+    range_min_ = range_min;
+    range_max_ = range_max;
+    cur_file_id_ = range_min_ - 1;
+    return open_next_partition();
+  }
+
+  int read(ObLoadDatumRow *&datum_row) {
+    // TODO: select pk via StorageDatumUtils
+    int ret;
+    int64_t pos;
+    auto begin = buffer_.begin();
+    auto end = buffer_.end();
+    if (OB_SUCC(datum_row->deserialize(begin, end - begin, pos))) {
+      return ret;
+    }
+
+    if (OB_FAIL(read_next_buffer())) {
+      if (ret == OB_ITER_END) {
+        // all partitions have been read
+        return ret;
+      }
+      // why failure?
+      LOG_WARN("fail to read next buffer", KR(ret));
+    }
+    return OB_EMPTY_RANGE;
+  }
+
+private:
+  int read_next_buffer() {
+    int ret = OB_SUCCESS;
+    if (OB_FAIL(buffer_.squash())) {
+      LOG_WARN("fail to squash buffer", KR(ret));
+    } else if (OB_FAIL(file_reader_.read_next_buffer(buffer_))) {
+      if (OB_UNLIKELY(OB_ITER_END != ret)) {
+        LOG_WARN("fail to read next buffer", KR(ret));
+      } else {
+        if (OB_UNLIKELY(!buffer_.empty())) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("unexpected incomplate data", KR(ret));
+        } else {
+          // this file has been comsumed, and the next one will be read instead
+          if (OB_FAIL(open_next_partition())) {
+            return ret;
+          }
+          return read_next_buffer();
+        }
+      }
+    } else if (OB_UNLIKELY(buffer_.empty())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected empty buffer", KR(ret));
+    }
+    return ret;
+  }
+
+  int open_next_partition() {
+    int ret;
+    do {
+      if (++cur_file_id_ > range_max_) {
+        return OB_ITER_END;
+      }
+      std::string file_path = partition_directory_ + "/" + std::to_string(++cur_file_id_);
+      ret = file_reader_.open(ObString(file_path.c_str()));
+    } while (ret != OB_SUCCESS);
+    return ret;
+  }
+
+private:
+  std::string partition_directory_;
+  int64_t range_min_;
+  int64_t range_max_;
+  int64_t cur_file_id_;
+  ObLoadSequentialFileReader file_reader_;
+  ObLoadDataBuffer buffer_;
+};
+
+class ObRangePartitionSplitter
+{
+public:
+  static const int64_t FILE_BUFFER_SIZE = (2LL << 20); // 2M
+
+  ObRangePartitionSplitter() {}
+
+  int init(ObLoadDataStmt &load_stmt, std::string partition_directory) {
+    int ret = OB_SUCCESS;
+    const ObLoadArgument &load_args = load_stmt.get_load_arguments();
+    const ObIArray<ObLoadDataStmt::FieldOrVarStruct> &field_or_var_list =
+      load_stmt.get_field_or_var_list();
+    const uint64_t tenant_id = load_args.tenant_id_;
+    const uint64_t table_id = load_args.table_id_;
+    ObSchemaGetterGuard schema_guard;
+    const ObTableSchema *table_schema = nullptr;
+    if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_tenant_schema_guard(tenant_id,
+                                                                                    schema_guard))) {
+      LOG_WARN("fail to get tenant schema guard", KR(ret), K(tenant_id));
+    } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id, table_id, table_schema))) {
+      LOG_WARN("fail to get table schema", KR(ret), K(tenant_id), K(table_id));
+    } else if (OB_ISNULL(table_schema)) {
+      ret = OB_TABLE_NOT_EXIST;
+      LOG_WARN("table not exist", KR(ret), K(tenant_id), K(table_id));
+    } else if (OB_UNLIKELY(table_schema->is_heap_table())) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("not support heap table", KR(ret));
+    }
+    // init partition_writer_
+    else if (OB_FAIL(partition_writer_.init(partition_directory))) {
+      LOG_WARN("fail to init partition writer", KR(ret));
+    }
+    // init csv_parser_
+    else if (OB_FAIL(csv_parser_.init(load_stmt.get_data_struct_in_file(), field_or_var_list.count(),
+                                      load_args.file_cs_type_))) {
+      LOG_WARN("fail to init csv parser", KR(ret));
+    }
+    // init file_reader_
+    else if (OB_FAIL(file_reader_.open(load_args.full_file_path_))) {
+      LOG_WARN("fail to open file", KR(ret), K(load_args.full_file_path_));
+    }
+    // init buffer_
+    else if (OB_FAIL(buffer_.create(FILE_BUFFER_SIZE))) {
+      LOG_WARN("fail to create buffer", KR(ret));
+    }
+    // init row_caster_
+    else if (OB_FAIL(row_caster_.init(table_schema, field_or_var_list))) {
+      LOG_WARN("fail to init row caster", KR(ret));
+    }
+    return ret;
+  }
+
+  int split() {
+    int ret = OB_SUCCESS;
+    const ObNewRow *new_row = nullptr;
+    const ObLoadDatumRow *datum_row = nullptr;
+
+    while (OB_SUCC(ret)) {
+      if (OB_FAIL(buffer_.squash())) {
+        LOG_WARN("fail to squash buffer", KR(ret));
+      } else if (OB_FAIL(file_reader_.read_next_buffer(buffer_))) {
+        if (OB_UNLIKELY(OB_ITER_END != ret)) {
+          LOG_WARN("fail to read next buffer", KR(ret));
+        } else {
+          if (OB_UNLIKELY(!buffer_.empty())) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("unexpected incomplate data", KR(ret));
+          }
+          ret = OB_SUCCESS;
+          break;
+        }
+      } else if (OB_UNLIKELY(buffer_.empty())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected empty buffer", KR(ret));
+      } else {
+        while (OB_SUCC(ret)) {
+          if (OB_FAIL(csv_parser_.get_next_row(buffer_, new_row))) {
+            // TODO: faster parser
+            if (OB_UNLIKELY(OB_ITER_END != ret)) {
+              LOG_WARN("fail to get next row", KR(ret));
+            } else {
+              ret = OB_SUCCESS;
+              break;
+            }
+          } else if (OB_FAIL(row_caster_.get_casted_row(*new_row, datum_row))) {
+            // Cost: 19.37%
+            LOG_WARN("fail to cast row", KR(ret));
+          } else if (OB_FAIL(partition_writer_.append_row(datum_row))) {
+            LOG_WARN("fail to write partition", KR(ret));
+          }
+        }
+      }
+    }
+
+    return ret;
+  }
+
 private:
   ObLoadCSVPaser csv_parser_;
   ObLoadSequentialFileReader file_reader_;
   ObLoadDataBuffer buffer_;
   ObLoadRowCaster row_caster_;
-  ObLoadExternalSort external_sort_;
-  ObLoadSSTableWriter sstable_writer_;
+  ObPartitionWriter partition_writer_;
 };
 
+class ObLoadSort
+{
+public:
+  ObLoadSort() {}
+
+  int init(const share::schema::ObTableSchema *table_schema,
+          int64_t mem_size,
+          int64_t file_buf_size) {
+    int ret = OB_SUCCESS;
+    if (IS_INIT) {
+      ret = OB_INIT_TWICE;
+      LOG_WARN("ObLoadSort init twice", KR(ret), KP(this));
+    } else if (OB_UNLIKELY(nullptr == table_schema)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid args", KR(ret), KP(table_schema));
+    } else {
+      allocator_.set_tenant_id(MTL_ID());
+      const int64_t rowkey_column_num = table_schema->get_rowkey_column_num();
+      ObArray<ObColDesc> multi_version_column_descs;
+      if (OB_FAIL(table_schema->get_multi_version_column_descs(multi_version_column_descs))) {
+        LOG_WARN("fail to get multi version column descs", KR(ret));
+      } else if (OB_FAIL(datum_utils_.init(multi_version_column_descs, rowkey_column_num,
+                                          is_oracle_mode(), allocator_))) {
+        LOG_WARN("fail to init datum utils", KR(ret));
+      } else if (OB_FAIL(compare_.init(rowkey_column_num, &datum_utils_))) {
+        LOG_WARN("fail to init compare", KR(ret));
+      } else {
+        is_inited_ = true;
+        pos_ = 0;
+        datum_rows_.clear();
+      }
+    }
+    return ret;
+  }
+
+  int reuse() {
+    datum_rows_.clear();
+    pos_ = 0;
+    return OB_SUCCESS;
+  }
+
+  int append_row(ObLoadDatumRow *&datum_row) {
+    datum_rows_.push_back(datum_row);
+    return OB_SUCCESS;
+  }
+
+  int close() {
+    std::sort(datum_rows_.begin(), datum_rows_.end());
+    return OB_SUCCESS;
+  }
+
+  int get_next_row(ObLoadDatumRow *&datum_row) {
+    if (pos_ >= datum_rows_.size())
+      return OB_ITER_END;
+    datum_row = datum_rows_[pos_++];
+    return OB_SUCCESS;
+  }
+
+private:
+  common::ObArenaAllocator allocator_;
+  blocksstable::ObStorageDatumUtils datum_utils_;
+  ObLoadDatumRowCompare compare_;
+  std::vector<ObLoadDatumRow *> datum_rows_;
+  int pos_;
+  bool is_closed_;
+  bool is_inited_;
+};
+
+
+class ObLoadDataDirect : public ObLoadDataBase
+{
+    static const int64_t MEM_BUFFER_SIZE = (1LL << 30); // 1G
+    static const int64_t FILE_BUFFER_SIZE = (2LL << 20); // 2M
+public:
+    ObLoadDataDirect() {}
+    virtual ~ObLoadDataDirect() {}
+    int execute(ObExecContext &ctx, ObLoadDataStmt &load_stmt) override;
+private:
+    int inner_init(ObLoadDataStmt &load_stmt);
+    int do_load();
+private:
+    ObRangePartitionSplitter partition_splitter_;
+    ObPartitionReader partition_reader_;
+    ObLoadCSVPaser csv_parser_;
+    ObLoadSequentialFileReader file_reader_;
+    ObLoadDataBuffer buffer_;
+    ObLoadRowCaster row_caster_;
+    ObLoadSort sort_;
+    ObLoadSSTableWriter sstable_writer_;
+};
 } // namespace sql
 } // namespace oceanbase
