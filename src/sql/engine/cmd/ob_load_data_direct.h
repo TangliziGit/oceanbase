@@ -11,11 +11,20 @@
 #include "storage/blocksstable/ob_index_block_builder.h"
 #include "storage/ob_parallel_external_sort.h"
 #include "storage/tx_storage/ob_ls_handle.h"
+#include "share/ob_thread_pool.h"
+#include "lib/lock/ob_spin_lock.h"
+#include "common/ob_clock_generator.h"
+#include <atomic>
+#include <queue>
 
 namespace oceanbase
 {
 namespace sql
 {
+constexpr int64_t TASK_SIZE = (1LL << 28); // 512M
+constexpr int64_t MEM_BUFFER_SIZE = (1LL << 30); // 1G
+constexpr int64_t FILE_BUFFER_SIZE = (2LL << 20); // 2M
+constexpr int64_t N_CPU = 8;
 
 class ObLoadDataBuffer
 {
@@ -24,22 +33,34 @@ public:
   ~ObLoadDataBuffer();
   void reuse();
   void reset();
-  int create(int64_t capacity);
+  int create(int64_t capacity, int task_id);
   int squash();
   OB_INLINE char *data() const { return data_; }
   OB_INLINE char *begin() const { return data_ + begin_pos_; }
   OB_INLINE char *end() const { return data_ + end_pos_; }
   OB_INLINE bool empty() const { return end_pos_ == begin_pos_; }
+  OB_INLINE int64_t get_offset() const { return file_begin_pos_ + end_pos_ - begin_pos_; }
+  OB_INLINE bool is_compete() const { return file_end_pos_ <= file_begin_pos_; }
   OB_INLINE int64_t get_data_size() const { return end_pos_ - begin_pos_; }
   OB_INLINE int64_t get_remain_size() const { return capacity_ - end_pos_; }
-  OB_INLINE void consume(int64_t size) { begin_pos_ += size; }
+  OB_INLINE int64_t get_file_pos() const { return file_begin_pos_; }
+  OB_INLINE bool should_step() const { return step_; }
+  OB_INLINE void set_step(bool flag) { step_ = flag; } 
+  OB_INLINE void consume(int64_t size)
+  {
+    begin_pos_ += size;
+    file_begin_pos_ += size;
+  }
   OB_INLINE void produce(int64_t size) { end_pos_ += size; }
 private:
   common::ObArenaAllocator allocator_;
   char *data_;
   int64_t begin_pos_;
   int64_t end_pos_;
+  int64_t file_begin_pos_;
+  int64_t file_end_pos_;
   int64_t capacity_;
+  bool step_;
 };
 
 class ObLoadSequentialFileReader
@@ -153,13 +174,17 @@ public:
   int init(const share::schema::ObTableSchema *table_schema, int64_t mem_size,
            int64_t file_buf_size);
   int append_row(const ObLoadDatumRow &datum_row);
+  uint64_t get_size() const { return size_;};
   int close();
   int get_next_row(const ObLoadDatumRow *&datum_row);
+  ObLoadDatumRowCompare& get_compare() { return compare_; };
 private:
   common::ObArenaAllocator allocator_;
+  common::ObSpinLock lock_;
   blocksstable::ObStorageDatumUtils datum_utils_;
   ObLoadDatumRowCompare compare_;
   storage::ObExternalSort<ObLoadDatumRow, ObLoadDatumRowCompare> external_sort_;
+  uint64_t size_ = 0;
   bool is_closed_;
   bool is_inited_;
 };
@@ -193,10 +218,42 @@ private:
   bool is_inited_;
 };
 
+class ObLoadController : public share::ObThreadPool {
+public:
+  ObLoadController();
+  ~ObLoadController();
+public:
+  int init(ObLoadDataStmt *load_stmt,
+          ObLoadSequentialFileReader* file_reader,
+          const ObTableSchema *table_schema);
+  virtual void run1();
+
+  int get_res() const { return ret_.load();}
+  
+  int32_t getTask();
+  int next_row_init();
+  int get_next_row(const ObLoadDatumRow *&datum_row);
+  ObLoadDatumRowCompare& get_compare() { return external_sorts_[0].get_compare();};
+  uint64_t get_size(int index) { return external_sorts_[index].get_size(); };
+private:
+  ObLoadCSVPaser csv_parser_;
+  ObLoadSequentialFileReader *file_reader_;
+  ObLoadExternalSort external_sorts_[N_CPU]; 
+  // ObLoadExternalSort external_sort_;
+  int pos_ = 0;
+  const ObLoadDatumRow* pre_sorts_[N_CPU];
+  ObLoadDataStmt *load_stmt_;
+  ObLoadDatumRowCompare compare_;
+  const ObTableSchema *table_schema_;
+  
+  common::ObSpinLock lock_;
+  std::atomic<int32_t> task_id_ = {0};
+  std::atomic<int32_t> finished_tasks_ = {8};
+  std::atomic<int> ret_ = {0};
+};
+
 class ObLoadDataDirect : public ObLoadDataBase
 {
-  static const int64_t MEM_BUFFER_SIZE = (1LL << 30); // 1G
-  static const int64_t FILE_BUFFER_SIZE = (2LL << 20); // 2M
 public:
   ObLoadDataDirect();
   virtual ~ObLoadDataDirect();
@@ -207,9 +264,7 @@ private:
 private:
   ObLoadCSVPaser csv_parser_;
   ObLoadSequentialFileReader file_reader_;
-  ObLoadDataBuffer buffer_;
-  ObLoadRowCaster row_caster_;
-  ObLoadExternalSort external_sort_;
+  ObLoadController controller_;
   ObLoadSSTableWriter sstable_writer_;
 };
 

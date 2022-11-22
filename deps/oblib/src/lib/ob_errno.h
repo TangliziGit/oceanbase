@@ -30,6 +30,7 @@ constexpr int OB_NOT_SUPPORTED = -4007;
 constexpr int OB_ITER_END = -4008;
 constexpr int OB_IO_ERROR = -4009;
 constexpr int OB_ERROR_FUNC_VERSION = -4010;
+constexpr int OB_TASK_FINISH = -4011;
 constexpr int OB_TIMEOUT = -4012;
 constexpr int OB_ALLOCATE_MEMORY_FAILED = -4013;
 constexpr int OB_INNER_STAT_ERROR = -4014;
