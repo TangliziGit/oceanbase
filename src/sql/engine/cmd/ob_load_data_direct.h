@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "map"
 #include "fstream"
 #include "lib/file/ob_file.h"
 #include "lib/timezone/ob_timezone_info.h"
@@ -219,17 +220,36 @@ public:
   int append_row(const ObLoadDatumRow *&datum_row) {
     // TODO: select pk via StorageDatumUtils
     int64_t key = gen_key(datum_row->datums_[0].get_int());
+
     char buf[1024];
     int64_t pos = 0;
+    int ret = datum_row->serialize(buf, 1024, pos);
 
-    std::ofstream fout;
-    fout.open(partition_directory_ + "/" + std::to_string(key), std::ios_base::app);
-    datum_row->serialize(buf, 1024, pos);
-    fout.write(buf, pos);
-    return OB_SUCCESS;
+    partition_stream(key)->write(buf, pos);
+    return ret;
   }
+
+  void close() {
+    for (auto &pair: streams_) {
+      pair.second->close();
+    }
+  }
+
 private:
+  std::ofstream *partition_stream(int64_t key) {
+    std::string file_path = partition_directory_ + "/" + std::to_string(key);
+    auto iter = streams_.find(file_path);
+    if (iter != streams_.end()) {
+      return iter->second;
+    }
+
+    auto stream = new std::ofstream(file_path, std::ios::app);
+    streams_[file_path] = stream;
+    return stream;
+  }
+
   std::string partition_directory_;
+  std::map<std::string, std::ofstream *> streams_;
 };
 
 // TODO: parallel optimize
@@ -382,7 +402,7 @@ public:
         } else {
           if (OB_UNLIKELY(!buffer_.empty())) {
             ret = OB_ERR_UNEXPECTED;
-            LOG_WARN("unexpected incomplate data", KR(ret));
+            LOG_WARN("unexpected incomplete data", KR(ret));
           }
           ret = OB_SUCCESS;
           break;
@@ -410,6 +430,7 @@ public:
       }
     }
 
+    partition_writer_.close();
     return ret;
   }
 

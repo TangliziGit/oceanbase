@@ -26,13 +26,13 @@ namespace sql
 int ObLoadDataExecutor::execute(ObExecContext &ctx, ObLoadDataStmt &stmt)
 {
   int ret = OB_SUCCESS;
-  ObLoadDataBase *load_impl = NULL;
+  ObLoadDataBase *load_impl = new ObLoadDataDirect();
   if (!stmt.get_load_arguments().is_csv_format_) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("invalid resolver results", K(ret));
-  } else if (OB_ISNULL(load_impl = OB_NEW(ObLoadDataDirect, (&ctx.get_allocator())))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-    LOG_WARN("allocate memory failed", K(ret));
+  // } else if (OB_ISNULL(load_impl = OB_NEW(ObLoadDataDirect, (&ctx.get_allocator())))) {
+  //   ret = OB_ALLOCATE_MEMORY_FAILED;
+  //   LOG_WARN("allocate memory failed", K(ret));
   } else {
     if (OB_FAIL(load_impl->execute(ctx, stmt))) {
       LOG_WARN("failed to execute load data stmt", K(ret));
