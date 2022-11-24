@@ -11,7 +11,6 @@
 #include "storage/tablet/ob_tablet_create_delete_helper.h"
 #include "storage/tx_storage/ob_ls_service.h"
 #include "share/ob_thread_pool.h"
-#include <iostream>
 
 namespace oceanbase
 {
@@ -1093,7 +1092,7 @@ int ObLoadController::get_next_row(const ObLoadDatumRow *&datum_row) {
     if (lhs == nullptr) {
       return OB_ITER_END;
     }
-    return OB_SUCCESS;
+    return ret;
     //return external_sorts_[0].get_next_row(datum_row);
     //return external_sort_.get_next_row(datum_row);
   }
@@ -1167,9 +1166,7 @@ int ObLoadDataDirect::do_load()
   controller_.set_thread_count(8);
   controller_.set_run_wrapper(MTL_CTX());
   controller_.start();
-  std::cout << "thread pool start !" << std::endl;
   controller_.wait();
-  std::cout << "thread pool complete !" << std::endl;
 
   if (OB_FAIL(controller_.next_row_init())) {
     LOG_WARN("controller next row init error!");

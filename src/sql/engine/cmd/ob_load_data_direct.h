@@ -15,7 +15,6 @@
 #include "lib/lock/ob_spin_lock.h"
 #include "common/ob_clock_generator.h"
 #include <atomic>
-#include <queue>
 
 namespace oceanbase
 {
