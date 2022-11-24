@@ -16,7 +16,13 @@
 #include "storage/ob_parallel_external_sort.h"
 #include "storage/tx_storage/ob_ls_handle.h"
 
-static const int64_t FILE_BUFFER_SIZE = (2LL << 20); // 2M
+static constexpr int64_t FILE_BUFFER_SIZE = (200LL << 20); // 200M
+static constexpr int64_t PARTITION_NUM = 400;
+static constexpr int64_t PK_MIN = 1;
+static constexpr int64_t PK_MAX = 300000000;
+static constexpr int64_t PK_SPAN = (PK_MAX - PK_MIN + 1) / PARTITION_NUM;
+static const char * PARTITION_DIR = "./partition/";
+
 
 namespace oceanbase
 {
@@ -200,12 +206,6 @@ private:
   bool is_inited_;
 };
 
-
-static constexpr int64_t PARTITION_NUM = 40;
-static constexpr int64_t PK_MIN = 1;
-static constexpr int64_t PK_MAX = 300000000;
-static constexpr int64_t PK_SPAN = (PK_MAX - PK_MIN + 1) / PARTITION_NUM;
-
 // TODO: data sketch
 // TODO: parallel optimize
 class ObPartitionWriter
@@ -292,8 +292,8 @@ public:
       buffer_.consume(pos);
       return ret;
     }
-    // delete datum_row;
-    // datum_row = nullptr;
+    delete datum_row;
+    datum_row = nullptr;
 
     bool file_consumed = false;
     if (OB_FAIL(read_next_buffer())) {
@@ -308,8 +308,8 @@ public:
       if (OB_FAIL(open_next_partition())) {
         LOG_WARN("fail to open next partition", KR(ret));
         return OB_ITER_END;
-      } else if (OB_FAIL(read_next_buffer())) {
-        LOG_WARN("fail to read next buffer", KR(ret));
+      // } else if (OB_FAIL(read_next_buffer())) {
+      //   LOG_WARN("fail to read next buffer", KR(ret));
       }
       return OB_EMPTY_RANGE;
     }
@@ -381,6 +381,7 @@ public:
   int init(ObLoadDataStmt &load_stmt, std::string partition_directory) {
     int ret = OB_SUCCESS;
     remove_recursive(partition_directory.c_str());
+    mkdir(PARTITION_DIR, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
     mkdir(partition_directory.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
 
     const ObLoadArgument &load_args = load_stmt.get_load_arguments();
@@ -546,6 +547,11 @@ public:
   }
 
   int append_row(ObLoadDatumRow *datum_row) {
+    if (datum_row == nullptr) {
+      LOG_WARN("received null datum row");
+      return OB_ERR_UNEXPECTED;
+    }
+
     datum_rows_.push_back(datum_row);
     int64_t pk1 = datum_row->datums_[0].get_int();
     int64_t pk2 = datum_row->datums_[1].get_int();

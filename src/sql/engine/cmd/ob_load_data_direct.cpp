@@ -942,7 +942,7 @@ int ObLoadDataDirect::inner_init(ObLoadDataStmt &load_stmt)
   const ObTableSchema *table_schema = nullptr;
 
   // split parittion
-  std::string partition_directory = "/tmp/oceanbase/" + std::to_string(table_id);
+  std::string partition_directory = PARTITION_DIR + std::to_string(table_id);
   if (OB_FAIL(partition_splitter_.init(load_stmt, partition_directory))) {
     LOG_WARN("fail to init partition splitter", KR(ret));
   } else if (OB_FAIL(partition_splitter_.split())) {
