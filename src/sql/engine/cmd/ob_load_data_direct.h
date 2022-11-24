@@ -22,8 +22,9 @@ namespace sql
 {
 constexpr int64_t TASK_SIZE = (1LL << 28); // 512M
 constexpr int64_t MEM_BUFFER_SIZE = (1LL << 30); // 1G
+constexpr int64_t SORT_BUFFER_SIZE = 8 * (1LL << 30); // 8G
 constexpr int64_t FILE_BUFFER_SIZE = (2LL << 20); // 2M
-constexpr int64_t N_CPU = 8;
+constexpr int64_t N_CPU = 16;
 
 class ObLoadDataBuffer
 {
@@ -247,7 +248,6 @@ private:
   
   common::ObSpinLock lock_;
   std::atomic<int32_t> task_id_ = {0};
-  std::atomic<int32_t> finished_tasks_ = {8};
   std::atomic<int> ret_ = {0};
 };
 

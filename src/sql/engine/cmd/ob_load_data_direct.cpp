@@ -932,7 +932,7 @@ int ObLoadController::init(ObLoadDataStmt *load_stmt,
             file_reader_ = file_reader;
             table_schema_ = table_schema;
             for (int64_t i = 0; i < N_CPU; i++) {
-              if (OB_FAIL(external_sorts_[i].init(table_schema, 4 * MEM_BUFFER_SIZE / N_CPU, FILE_BUFFER_SIZE))) {
+              if (OB_FAIL(external_sorts_[i].init(table_schema, SORT_BUFFER_SIZE / N_CPU, FILE_BUFFER_SIZE))) {
                 break;
               }
             }
@@ -1046,7 +1046,9 @@ void ObLoadController::run1()
         LOG_WARN("fail to close external sort", KR(ret));
       }
     }
-    ret_.store(ret);
+    if (OB_FAIL(ret)) {
+      ret_.store(ret);
+    }
     LOG_INFO("TASK all tt block",K(thread_id), K(all_size), K(ret));
   }
   
@@ -1169,7 +1171,7 @@ int ObLoadDataDirect::inner_init(ObLoadDataStmt &load_stmt)
 int ObLoadDataDirect::do_load()
 {
   int ret = OB_SUCCESS;
-  controller_.set_thread_count(8);
+  controller_.set_thread_count(N_CPU);
   controller_.set_run_wrapper(MTL_CTX());
   controller_.start();
   controller_.wait();
