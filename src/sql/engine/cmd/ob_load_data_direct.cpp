@@ -1046,6 +1046,7 @@ void ObLoadController::run1()
         LOG_WARN("fail to close external sort", KR(ret));
       }
     }
+    ret_.store(ret);
     LOG_INFO("TASK all tt block",K(thread_id), K(all_size), K(ret));
   }
   
@@ -1058,7 +1059,12 @@ int ObLoadController::next_row_init() {
     int ret = OB_SUCCESS;
     for (int i = 1; i < N_CPU; i++) {
       if (OB_FAIL(external_sorts_[i].get_next_row(temp))) {
-        temp = nullptr;
+        if (OB_UNLIKELY(OB_ITER_END != ret)) {
+          LOG_WARN("fail to get next row", KR(ret));
+        } else {
+          temp = nullptr;
+          ret = OB_SUCCESS;
+        }
       }
       pre_sorts_[i] = temp;
     }

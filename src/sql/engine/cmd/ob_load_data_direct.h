@@ -39,7 +39,7 @@ public:
   OB_INLINE char *end() const { return data_ + end_pos_; }
   OB_INLINE bool empty() const { return end_pos_ == begin_pos_; }
   OB_INLINE int64_t get_offset() const { return file_begin_pos_ + end_pos_ - begin_pos_; }
-  OB_INLINE bool is_compete() const { return file_end_pos_ <= file_begin_pos_; }
+  OB_INLINE bool is_compete() const { return file_end_pos_ < file_begin_pos_; }
   OB_INLINE int64_t get_data_size() const { return end_pos_ - begin_pos_; }
   OB_INLINE int64_t get_remain_size() const { return capacity_ - end_pos_; }
   OB_INLINE int64_t get_file_pos() const { return file_begin_pos_; }
