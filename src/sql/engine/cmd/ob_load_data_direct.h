@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <dirent.h>
+#include <unistd.h>
 #include "map"
 #include "fstream"
 #include "lib/file/ob_file.h"
@@ -13,6 +15,8 @@
 #include "storage/blocksstable/ob_index_block_builder.h"
 #include "storage/ob_parallel_external_sort.h"
 #include "storage/tx_storage/ob_ls_handle.h"
+
+static const int64_t FILE_BUFFER_SIZE = (2LL << 20); // 2M
 
 namespace oceanbase
 {
@@ -50,6 +54,7 @@ public:
   ObLoadSequentialFileReader();
   ~ObLoadSequentialFileReader();
   int open(const ObString &filepath);
+  void close() { file_reader_.close(); offset_ = 0; }
   int read_next_buffer(ObLoadDataBuffer &buffer);
 private:
   common::ObFileReader file_reader_;
@@ -263,29 +268,52 @@ public:
     partition_directory_ = partition_directory;
     range_min_ = range_min;
     range_max_ = range_max;
-    cur_file_id_ = range_min_ - 1;
-    return open_next_partition();
+    next_file_id_ = range_min_;
+
+    int ret = OB_SUCCESS;
+    if (OB_FAIL(buffer_.create(FILE_BUFFER_SIZE))) {
+      LOG_WARN("fail to create buffer during partition reader init", KR(ret));
+    } else if (OB_FAIL(open_next_partition())) {
+      LOG_WARN("fail to open next partition", KR(ret));
+    } else if (OB_FAIL(read_next_buffer())) {
+      LOG_WARN("fail to read next buffer", KR(ret));
+    }
+    return ret;
   }
 
   int read(ObLoadDatumRow *&datum_row) {
     // TODO: select pk via StorageDatumUtils
     int ret;
-    int64_t pos;
+    int64_t pos = 0;
     auto begin = buffer_.begin();
     auto end = buffer_.end();
+    datum_row = new ObLoadDatumRow();
     if (OB_SUCC(datum_row->deserialize(begin, end - begin, pos))) {
+      buffer_.consume(pos);
       return ret;
     }
+    // delete datum_row;
+    // datum_row = nullptr;
 
+    bool file_consumed = false;
     if (OB_FAIL(read_next_buffer())) {
       if (ret == OB_ITER_END) {
-        // all partitions have been read
-        return ret;
+        file_consumed = true;
+      } else {
+        LOG_WARN("fail to read next buffer with unexpected error", KR(ret));
       }
-      // why failure?
-      LOG_WARN("fail to read next buffer", KR(ret));
     }
-    return OB_EMPTY_RANGE;
+
+    if (file_consumed) {
+      if (OB_FAIL(open_next_partition())) {
+        LOG_WARN("fail to open next partition", KR(ret));
+        return OB_ITER_END;
+      } else if (OB_FAIL(read_next_buffer())) {
+        LOG_WARN("fail to read next buffer", KR(ret));
+      }
+      return OB_EMPTY_RANGE;
+    }
+    return ret;
   }
 
 private:
@@ -299,13 +327,10 @@ private:
       } else {
         if (OB_UNLIKELY(!buffer_.empty())) {
           ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("unexpected incomplate data", KR(ret));
+          LOG_WARN("unexpected incomplete data", KR(ret));
         } else {
-          // this file has been comsumed, and the next one will be read instead
-          if (OB_FAIL(open_next_partition())) {
-            return ret;
-          }
-          return read_next_buffer();
+          // this file has been consumed, and the next one will be read instead
+          ret = OB_ITER_END;
         }
       }
     } else if (OB_UNLIKELY(buffer_.empty())) {
@@ -316,14 +341,25 @@ private:
   }
 
   int open_next_partition() {
-    int ret;
-    do {
-      if (++cur_file_id_ > range_max_) {
-        return OB_ITER_END;
-      }
-      std::string file_path = partition_directory_ + "/" + std::to_string(++cur_file_id_);
-      ret = file_reader_.open(ObString(file_path.c_str()));
-    } while (ret != OB_SUCCESS);
+    int ret = OB_SUCCESS;
+    int i = next_file_id_;
+    for (; i <= range_max_; i++) {
+      std::string file_path = partition_directory_ + "/" + std::to_string(i);
+      ObString path{file_path.c_str()};
+
+      file_reader_.close();
+      if (OB_SUCC(file_reader_.open(path))) break;
+      if (ret == OB_FILE_NOT_EXIST) continue;
+      LOG_WARN("fail to open file during open next partition", KR(ret));
+    }
+
+    if (i > range_max_) {
+      next_file_id_ = range_max_ + 1;
+      return OB_ITER_END;
+    }
+    buffer_.reuse();
+    next_file_id_ = i+1;
+    LOG_INFO("open partition file successfully", K(i));
     return ret;
   }
 
@@ -331,7 +367,7 @@ private:
   std::string partition_directory_;
   int64_t range_min_;
   int64_t range_max_;
-  int64_t cur_file_id_;
+  int64_t next_file_id_;
   ObLoadSequentialFileReader file_reader_;
   ObLoadDataBuffer buffer_;
 };
@@ -339,12 +375,14 @@ private:
 class ObRangePartitionSplitter
 {
 public:
-  static const int64_t FILE_BUFFER_SIZE = (2LL << 20); // 2M
 
   ObRangePartitionSplitter() {}
 
   int init(ObLoadDataStmt &load_stmt, std::string partition_directory) {
     int ret = OB_SUCCESS;
+    remove_recursive(partition_directory.c_str());
+    mkdir(partition_directory.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
+
     const ObLoadArgument &load_args = load_stmt.get_load_arguments();
     const ObIArray<ObLoadDataStmt::FieldOrVarStruct> &field_or_var_list =
       load_stmt.get_field_or_var_list();
@@ -435,6 +473,30 @@ public:
   }
 
 private:
+  static int remove_recursive(const char *const path) {
+    DIR *const directory = opendir(path);
+    if (directory) {
+      struct dirent *entry;
+      while ((entry = readdir(directory))) {
+        if (!strcmp(".", entry->d_name) || !strcmp("..", entry->d_name)) {
+          continue;
+        }
+        char filename[strlen(path) + strlen(entry->d_name) + 2];
+        sprintf(filename, "%s/%s", path, entry->d_name);
+        int (*const remove_func)(const char*) = entry->d_type == DT_DIR ? remove_recursive : remove;
+        LOG_INFO("delete entry", K(entry->d_name));
+        if (remove_func(entry->d_name)) {
+          closedir(directory);
+          return -1;
+        }
+      }
+      if (closedir(directory)) {
+        return -1;
+      }
+    }
+    return remove(path);
+  }
+
   ObLoadCSVPaser csv_parser_;
   ObLoadSequentialFileReader file_reader_;
   ObLoadDataBuffer buffer_;
@@ -483,13 +545,21 @@ public:
     return OB_SUCCESS;
   }
 
-  int append_row(ObLoadDatumRow *&datum_row) {
+  int append_row(ObLoadDatumRow *datum_row) {
     datum_rows_.push_back(datum_row);
+    int64_t pk1 = datum_row->datums_[0].get_int();
+    int64_t pk2 = datum_row->datums_[1].get_int();
+    LOG_INFO("sort append element: ", K(pk1), K(pk2), K((long)(datum_row))); //, K(*datum_row));
     return OB_SUCCESS;
   }
 
   int close() {
-    std::sort(datum_rows_.begin(), datum_rows_.end());
+    std::sort(datum_rows_.begin(), datum_rows_.end(), compare_);
+    for (auto &datum_row : datum_rows_) {
+      int64_t pk1 = datum_row->datums_[0].get_int();
+      int64_t pk2 = datum_row->datums_[1].get_int();
+      LOG_INFO("sort element: ", K(pk1), K(pk2), K((long)(datum_row))); //, K(*datum_row));
+    }
     return OB_SUCCESS;
   }
 

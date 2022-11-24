@@ -117,8 +117,6 @@ int ObLoadSequentialFileReader::read_next_buffer(ObLoadDataBuffer &buffer)
   if (OB_UNLIKELY(!file_reader_.is_opened())) {
     ret = OB_FILE_NOT_OPENED;
     LOG_WARN("file not opened", KR(ret));
-  } else if (is_read_end_) {
-    ret = OB_ITER_END;
   } else if (OB_LIKELY(buffer.get_remain_size() > 0)) {
     const int64_t buffer_remain_size = buffer.get_remain_size();
     int64_t read_size = 0;
@@ -326,8 +324,32 @@ OB_DEF_SERIALIZE(ObLoadDatumRow)
   return ret;
 }
 
-OB_DEF_DESERIALIZE(ObLoadDatumRow)
+int ObLoadDatumRow::deserialize(DESERIAL_PARAMS)
 {
+  int ret = OK_;
+  int64_t version = 0;
+  int64_t len = 0;
+  if (OB_SUCC(ret)) {
+    OB_UNIS_DECODEx(version);
+    OB_UNIS_DECODEx(len);
+    if (OB_SUCC(ret)) {
+      if (version != UNIS_VERSION) {
+        ret = ::oceanbase::common::OB_NOT_SUPPORTED;
+        RPC_WARN("object version mismatch", "cls", "ObLoadDatumRow", K(ret), K(version));
+      } else if (len < 0) {
+        ret = ::oceanbase::common::OB_ERR_UNEXPECTED;
+        RPC_WARN("can't decode object with negative length", K(len));
+      } else if (data_len < len + pos) {
+        ret = ::oceanbase::common::OB_DESERIALIZE_ERROR;
+        RPC_WARN("buf length not enough", K(len), K(pos), K(data_len));
+      }
+    }
+  }
+  CALL_DESERIALIZE_(len, dispatch_, UNIS_HAS_COMPAT(ObLoadDatumRow));
+  return ret;
+}
+
+int ObLoadDatumRow::deserialize_(DESERIAL_PARAMS) {
   int ret = OB_SUCCESS;
   int64_t count = 0;
   OB_UNIS_DECODE(count);
@@ -797,8 +819,11 @@ int ObLoadSSTableWriter::append_row(const ObLoadDatumRow &datum_row)
         datum_row_.storage_datums_[i + extra_rowkey_column_num_] = datum_row.datums_[i];
       }
     }
+    int64_t pk1 = datum_row.datums_[0].get_int();
+    int64_t pk2 = datum_row.datums_[1].get_int();
+    LOG_INFO("append element: ", K(pk1), K(pk2), K((long)(&datum_row)));
     if (OB_FAIL(macro_block_writer_.append_row(datum_row_))) {
-      LOG_WARN("fail to append row", KR(ret));
+      LOG_WARN("fail to append row", KR(ret), K(pk1), K(pk2));
     }
   }
   return ret;
@@ -971,9 +996,9 @@ int ObLoadDataDirect::do_load()
 {
   int ret = OB_SUCCESS;
   ObLoadDatumRow *datum_row = nullptr;
-  
+
   bool last_round = false;
-  while (OB_SUCC(ret)) {
+  while (OB_SUCC(ret) && last_round == false) {
     sort_.reuse();
     while (OB_SUCC(ret)) {
       if (OB_FAIL(partition_reader_.read(datum_row))) {
@@ -1007,6 +1032,9 @@ int ObLoadDataDirect::do_load()
         }
       } else if (OB_FAIL(sstable_writer_.append_row(*datum_row))) {
         LOG_WARN("fail to append row", KR(ret));
+      } else {
+        // TODO: correct?
+        delete datum_row;
       }
     }
   }
