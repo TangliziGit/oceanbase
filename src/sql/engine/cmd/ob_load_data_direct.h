@@ -6,6 +6,7 @@
 
 #include <dirent.h>
 #include <unistd.h>
+#include <atomic>
 #include "map"
 #include "fstream"
 #include "lib/file/ob_file.h"
@@ -15,6 +16,9 @@
 #include "storage/blocksstable/ob_index_block_builder.h"
 #include "storage/ob_parallel_external_sort.h"
 #include "storage/tx_storage/ob_ls_handle.h"
+#include "share/ob_thread_pool.h"
+#include "lib/lock/ob_spin_lock.h"
+#include "common/ob_clock_generator.h"
 
 static constexpr int64_t FILE_BUFFER_SIZE = (200LL << 20); // 200M
 static constexpr int64_t PARTITION_NUM = 400;
@@ -23,15 +27,23 @@ static constexpr int64_t PK_MAX = 300000000;
 static constexpr int64_t PK_SPAN = (PK_MAX - PK_MIN + 1) / PARTITION_NUM;
 static const char * PARTITION_DIR = "./load-partition/";
 
+static constexpr int64_t TASK_SIZE = (1LL << 28); // 256M
+static constexpr int64_t MEM_BUFFER_SIZE = (1LL << 30); // 1G
+static constexpr int64_t SORT_BUFFER_SIZE = 4 * (1LL << 30); // 4G
+static constexpr int64_t N_CPU = 16;
+
 // additional error code `OB_END_OF_PARTITION`,
 // which means this partition has been read through,
 // and next partition file is needed to be open.
-constexpr int OB_END_OF_PARTITION = -4745;
+static constexpr int OB_END_OF_PARTITION = -4745;
+static constexpr int OB_TASK_FINISH = -4011;
 
 namespace oceanbase
 {
 namespace sql
 {
+    // TODO
+constexpr int64_t FILE_BUFFER_SIZE = (2LL << 20); // 2M
 
 class ObLoadDataBuffer
 {
@@ -48,14 +60,36 @@ public:
   OB_INLINE bool empty() const { return end_pos_ == begin_pos_; }
   OB_INLINE int64_t get_data_size() const { return end_pos_ - begin_pos_; }
   OB_INLINE int64_t get_remain_size() const { return capacity_ - end_pos_; }
-  OB_INLINE void consume(int64_t size) { begin_pos_ += size; }
+  OB_INLINE virtual void consume(int64_t size) { begin_pos_ += size; }
   OB_INLINE void produce(int64_t size) { end_pos_ += size; }
-private:
+protected:
   common::ObArenaAllocator allocator_;
   char *data_;
   int64_t begin_pos_;
   int64_t end_pos_;
   int64_t capacity_;
+};
+
+class ObLoadFileDataBuffer : public ObLoadDataBuffer
+{
+public:
+  ObLoadFileDataBuffer() = default;
+  ~ObLoadFileDataBuffer() = default;
+public:
+  int create(int64_t capacity, int task_id);
+  OB_INLINE int64_t get_offset() const { return file_begin_pos_ + end_pos_ - begin_pos_; }
+  OB_INLINE bool is_compete() const { return file_end_pos_ < file_begin_pos_; }
+  OB_INLINE int64_t get_file_pos() const { return file_begin_pos_; }
+  OB_INLINE bool should_step() const { return step_; }
+  OB_INLINE void set_step(bool flag) { step_ = flag; }
+  OB_INLINE void consume(int64_t size) override {
+    begin_pos_ += size;
+    file_begin_pos_ += size;
+  }
+private:
+  int64_t file_begin_pos_;
+  int64_t file_end_pos_;
+  bool step_;
 };
 
 class ObLoadSequentialFileReader
@@ -67,6 +101,9 @@ public:
   void close() { file_reader_.close(); offset_ = 0; }
   int read_next_buffer(ObLoadDataBuffer &buffer);
 private:
+  int64_t get_offset(ObLoadDataBuffer &buffer) { return offset_; }
+  int64_t get_offset(ObLoadFileDataBuffer &buffer) { return buffer.get_offset(); }
+
   common::ObFileReader file_reader_;
   int64_t offset_;
   bool is_read_end_;
@@ -80,7 +117,7 @@ public:
   void reset();
   int init(const ObDataInFileStruct &format, int64_t column_count,
            common::ObCollationType collation_type);
-  int get_next_row(ObLoadDataBuffer &buffer, const common::ObNewRow *&row);
+  int get_next_row(ObLoadFileDataBuffer &buffer, const common::ObNewRow *&row);
 private:
   struct UnusedRowHandler
   {
@@ -208,6 +245,7 @@ public:
   }
 
   int append_row(const ObLoadDatumRow *&datum_row) {
+    // TODO: thread safty
     // TODO: select pk via StorageDatumUtils
     int64_t key = gen_key(datum_row->datums_[0].get_int());
 
@@ -373,104 +411,61 @@ private:
   ObLoadDataBuffer buffer_;
 };
 
-class ObRangePartitionSplitter
+// TODO: clean code
+class ObLoadDataSplitThreadPool : public share::ObThreadPool {
+public:
+  ObLoadDataSplitThreadPool() {}
+  ~ObLoadDataSplitThreadPool() {}
+
+public:
+  int init(ObLoadDataStmt *load_stmt, const ObTableSchema *table_schema, std::string partition_directory);
+  virtual void run1();
+
+  int get_res() const { return ret_.load(); }
+  int32_t get_task() { return task_id_.fetch_add(1); }
+  void close() { partition_writer_.close(); }
+
+private:
+  ObLoadDataStmt *load_stmt_;
+  const ObTableSchema *table_schema_;
+
+  ObLoadSequentialFileReader *file_reader_;
+  ObPartitionWriter partition_writer_;
+
+  common::ObSpinLock lock_;
+  std::atomic<int32_t> task_id_ = {0};
+  std::atomic<int> ret_ = {0};
+};
+
+class ObLoadDataSplitter
 {
 public:
+  ObLoadDataSplitter() = default;
 
-  ObRangePartitionSplitter() {}
-
-  int init(ObLoadDataStmt &load_stmt, std::string partition_directory) {
-    int ret = OB_SUCCESS;
+public:
+  int init(ObLoadDataStmt &load_stmt, const ObTableSchema *table_schema, std::string partition_directory) {
     remove_directory(partition_directory.c_str());
     mkdir(PARTITION_DIR, S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
     mkdir(partition_directory.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
 
-    const ObLoadArgument &load_args = load_stmt.get_load_arguments();
-    const ObIArray<ObLoadDataStmt::FieldOrVarStruct> &field_or_var_list =
-      load_stmt.get_field_or_var_list();
-    const uint64_t tenant_id = load_args.tenant_id_;
-    const uint64_t table_id = load_args.table_id_;
-    ObSchemaGetterGuard schema_guard;
-    const ObTableSchema *table_schema = nullptr;
-    if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_tenant_schema_guard(tenant_id,
-                                                                                    schema_guard))) {
-      LOG_WARN("fail to get tenant schema guard", KR(ret), K(tenant_id));
-    } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id, table_id, table_schema))) {
-      LOG_WARN("fail to get table schema", KR(ret), K(tenant_id), K(table_id));
-    } else if (OB_ISNULL(table_schema)) {
-      ret = OB_TABLE_NOT_EXIST;
-      LOG_WARN("table not exist", KR(ret), K(tenant_id), K(table_id));
-    } else if (OB_UNLIKELY(table_schema->is_heap_table())) {
-      ret = OB_NOT_SUPPORTED;
-      LOG_WARN("not support heap table", KR(ret));
-    }
-    // init partition_writer_
-    else if (OB_FAIL(partition_writer_.init(partition_directory))) {
-      LOG_WARN("fail to init partition writer", KR(ret));
-    }
-    // init csv_parser_
-    else if (OB_FAIL(csv_parser_.init(load_stmt.get_data_struct_in_file(), field_or_var_list.count(),
-                                      load_args.file_cs_type_))) {
-      LOG_WARN("fail to init csv parser", KR(ret));
-    }
-    // init file_reader_
-    else if (OB_FAIL(file_reader_.open(load_args.full_file_path_))) {
-      LOG_WARN("fail to open file", KR(ret), K(load_args.full_file_path_));
-    }
-    // init buffer_
-    else if (OB_FAIL(buffer_.create(FILE_BUFFER_SIZE))) {
-      LOG_WARN("fail to create buffer", KR(ret));
-    }
-    // init row_caster_
-    else if (OB_FAIL(row_caster_.init(table_schema, field_or_var_list))) {
-      LOG_WARN("fail to init row caster", KR(ret));
+    int ret = OB_SUCCESS;
+    if (OB_FAIL(split_pool_.init(&load_stmt, table_schema, partition_directory))) {
+      LOG_WARN("fail to init data split thread pool", KR(ret));
     }
     return ret;
   }
 
   int split() {
+    split_pool_.set_thread_count(N_CPU);
+    split_pool_.set_run_wrapper(MTL_CTX());
+    split_pool_.start();
+    split_pool_.wait();
+    split_pool_.close();
+
     int ret = OB_SUCCESS;
-    const ObNewRow *new_row = nullptr;
-    const ObLoadDatumRow *datum_row = nullptr;
-
-    while (OB_SUCC(ret)) {
-      if (OB_FAIL(buffer_.squash())) {
-        LOG_WARN("fail to squash buffer", KR(ret));
-      } else if (OB_FAIL(file_reader_.read_next_buffer(buffer_))) {
-        if (OB_UNLIKELY(OB_ITER_END != ret)) {
-          LOG_WARN("fail to read next buffer", KR(ret));
-        } else {
-          if (OB_UNLIKELY(!buffer_.empty())) {
-            ret = OB_ERR_UNEXPECTED;
-            LOG_WARN("unexpected incomplete data", KR(ret));
-          }
-          ret = OB_SUCCESS;
-          break;
-        }
-      } else if (OB_UNLIKELY(buffer_.empty())) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("unexpected empty buffer", KR(ret));
-      } else {
-        while (OB_SUCC(ret)) {
-          if (OB_FAIL(csv_parser_.get_next_row(buffer_, new_row))) {
-            // TODO: faster parser
-            if (OB_UNLIKELY(OB_ITER_END != ret)) {
-              LOG_WARN("fail to get next row", KR(ret));
-            } else {
-              ret = OB_SUCCESS;
-              break;
-            }
-          } else if (OB_FAIL(row_caster_.get_casted_row(*new_row, datum_row))) {
-            // Cost: 19.37%
-            LOG_WARN("fail to cast row", KR(ret));
-          } else if (OB_FAIL(partition_writer_.append_row(datum_row))) {
-            LOG_WARN("fail to write partition", KR(ret));
-          }
-        }
-      }
+    if (OB_FAIL(split_pool_.get_res())) {
+      LOG_WARN("controller read err.", K(ret));
     }
-
-    partition_writer_.close();
     return ret;
   }
 
@@ -492,11 +487,8 @@ private:
     return remove(path);
   }
 
-  ObLoadCSVPaser csv_parser_;
-  ObLoadSequentialFileReader file_reader_;
-  ObLoadDataBuffer buffer_;
-  ObLoadRowCaster row_caster_;
-  ObPartitionWriter partition_writer_;
+private:
+  ObLoadDataSplitThreadPool split_pool_;
 };
 
 class ObLoadSort
@@ -581,12 +573,9 @@ private:
     int inner_init(ObLoadDataStmt &load_stmt);
     int do_load();
 private:
-    ObRangePartitionSplitter partition_splitter_;
+    ObLoadDataSplitter partition_splitter_;
     ObPartitionReader partition_reader_;
-    ObLoadCSVPaser csv_parser_;
-    ObLoadSequentialFileReader file_reader_;
     ObLoadDataBuffer buffer_;
-    ObLoadRowCaster row_caster_;
     ObLoadSort sort_;
     ObLoadSSTableWriter sstable_writer_;
 };

@@ -10,6 +10,7 @@
 #include "share/tablet/ob_tablet_to_ls_operator.h"
 #include "storage/tablet/ob_tablet_create_delete_helper.h"
 #include "storage/tx_storage/ob_ls_service.h"
+#include "share/ob_thread_pool.h"
 
 namespace oceanbase
 {
@@ -49,6 +50,35 @@ void ObLoadDataBuffer::reset()
   begin_pos_ = 0;
   end_pos_ = 0;
   capacity_ = 0;
+}
+
+int ObLoadFileDataBuffer::create(int64_t capacity, int32_t task_id)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(nullptr != data_)) {
+    ret = OB_INIT_TWICE;
+    LOG_WARN("ObLoadDataBuffer init twice", KR(ret), KP(this));
+  } else if (OB_UNLIKELY(capacity <= 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid args", KR(ret), K(capacity));
+  } else if (OB_UNLIKELY(task_id < 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid args", KR(ret), K(task_id));
+  } else {
+    allocator_.set_tenant_id(MTL_ID());
+    if (OB_ISNULL(data_ = static_cast<char *>(allocator_.alloc(capacity)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("fail to alloc memory", KR(ret), K(capacity));
+    } else {
+      file_begin_pos_ = TASK_SIZE * task_id;
+      file_end_pos_ = TASK_SIZE * (task_id + 1);
+      capacity_ = capacity;
+    }
+    if (task_id != 0) {
+      set_step(true);
+    }
+  }
+  return ret;
 }
 
 int ObLoadDataBuffer::create(int64_t capacity)
@@ -120,10 +150,10 @@ int ObLoadSequentialFileReader::read_next_buffer(ObLoadDataBuffer &buffer)
   } else if (OB_LIKELY(buffer.get_remain_size() > 0)) {
     const int64_t buffer_remain_size = buffer.get_remain_size();
     int64_t read_size = 0;
-    if (OB_FAIL(file_reader_.pread(buffer.end(), buffer_remain_size, offset_, read_size))) {
+    if (OB_FAIL(file_reader_.pread(buffer.end(), buffer_remain_size, get_offset(buffer), read_size))) {
       LOG_WARN("fail to do pread", KR(ret));
     } else if (read_size == 0) {
-      is_read_end_ = true;
+      // is_read_end_ = true;
       ret = OB_ITER_END;
     } else {
       offset_ += read_size;
@@ -182,7 +212,7 @@ int ObLoadCSVPaser::init(const ObDataInFileStruct &format, int64_t column_count,
   return ret;
 }
 
-int ObLoadCSVPaser::get_next_row(ObLoadDataBuffer &buffer, const ObNewRow *&row)
+int ObLoadCSVPaser::get_next_row(ObLoadFileDataBuffer &buffer, const ObNewRow *&row)
 {
   int ret = OB_SUCCESS;
   row = nullptr;
@@ -195,11 +225,20 @@ int ObLoadCSVPaser::get_next_row(ObLoadDataBuffer &buffer, const ObNewRow *&row)
     if (OB_FAIL(csv_parser_.scan(str, end, nrows, nullptr, nullptr, unused_row_handler_,
                                  err_records_, false))) {
       LOG_WARN("fail to scan buffer", KR(ret));
+    } else if (buffer.should_step()) {
+      ret = OB_NEED_RETRY;
+      err_records_.reuse();
+      buffer.set_step(false);
+      buffer.consume(str - buffer.begin());
+      // LOG_INFO("task start offset.", K(buffer.get))
     } else if (OB_UNLIKELY(!err_records_.empty())) {
       ret = err_records_.at(0).err_code;
       LOG_WARN("fail to parse line", KR(ret));
     } else if (0 == nrows) {
       ret = OB_ITER_END;
+    } else if (buffer.is_compete()) {
+      ret = OB_TASK_FINISH;
+      LOG_INFO("TASK FINISH .", K(buffer.get_file_pos()));    
     } else {
       buffer.consume(str - buffer.begin());
       const ObIArray<ObCSVGeneralParser::FieldValue> &field_values_in_file =
@@ -806,6 +845,139 @@ int ObLoadSSTableWriter::close()
   return ret;
 }
 
+int ObLoadDataSplitThreadPool::init(ObLoadDataStmt *load_stmt,
+                                    const ObTableSchema *table_schema,
+                                    std::string partition_directory)
+{
+  load_stmt_ = load_stmt;
+  table_schema_ = table_schema;
+
+  int ret = OB_SUCCESS;
+  const ObLoadArgument &load_args = load_stmt->get_load_arguments();
+  if (OB_FAIL(file_reader_->open(load_args.full_file_path_))) {
+    LOG_WARN("fail to open file", KR(ret), K(load_args.full_file_path_));
+  } else if (OB_FAIL(partition_writer_.init(partition_directory))) {
+    LOG_WARN("fail to init partition writer", KR(ret));
+  }
+  return ret;
+}
+
+void ObLoadDataSplitThreadPool::run1()
+{
+  ObTenantStatEstGuard stat_est_guard(MTL_ID());
+  ObTenantBase *tenant_base = MTL_CTX();
+  Worker::CompatMode mode = ((ObTenant*)tenant_base)->get_compat_mode();
+  Worker::set_compatibility_mode(mode);
+
+  const ObLoadArgument &load_args = load_stmt_->get_load_arguments();
+  const auto &field_or_var_list = load_stmt_->get_field_or_var_list();
+  const int64_t thread_id = (const int64_t)(this->get_thread_idx());
+  LOG_INFO("data split start" , K(thread_id));
+
+  int ret = OB_SUCCESS;
+  int all_size = 0;
+  while (ret_.load() == OB_SUCCESS) {
+    int32_t task_id = get_task();
+    ObLoadCSVPaser csv_parser;
+    ObLoadFileDataBuffer buffer;
+    ObLoadRowCaster row_caster;
+
+    // init buffer
+    if (OB_FAIL(buffer.create(FILE_BUFFER_SIZE, task_id))) {
+      LOG_WARN("fail to create buffer", KR(ret));
+    }
+    // TODO: unnecessary initialization
+    // init csv_parser
+    else if (OB_FAIL(csv_parser.init(load_stmt_->get_data_struct_in_file(), field_or_var_list.count(),
+                                  load_args.file_cs_type_))) {
+      LOG_WARN("fail to init csv parser", KR(ret));
+    }
+    // TODO: unnecessary initialization
+    // init row_caster_
+    else if (OB_FAIL(row_caster.init(table_schema_, field_or_var_list))) {
+      LOG_WARN("fail to init row caster", KR(ret));
+    }
+    else {
+      const ObNewRow *new_row = nullptr;
+      const ObLoadDatumRow *datum_row = nullptr;
+      int block_id = 0;
+      int task_num = 0;
+      LOG_INFO("TASK START!", K(task_id));
+      while (OB_SUCC(ret)) {
+        if (OB_FAIL(buffer.squash())) {
+          LOG_WARN("fail to squash buffer", KR(ret));
+        } else if (OB_FAIL(file_reader_->read_next_buffer(buffer))) {
+          if (OB_UNLIKELY(OB_ITER_END == ret)) {
+            if (OB_UNLIKELY(!buffer.empty())) {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("unexpected incomplate data", KR(ret));
+            }
+            break;
+          } else {
+            LOG_WARN("fail to read next buffer", KR(ret));
+          }
+        } else if (OB_UNLIKELY(buffer.empty())) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("unexpected empty buffer", KR(ret));
+        } else {
+          //LOG_INFO("TASK block", K(task_id), K(block_id), K(ret));
+          while (OB_SUCC(ret)) {
+            if (OB_FAIL(csv_parser.get_next_row(buffer, new_row))) {
+              if (OB_UNLIKELY(OB_ITER_END == ret)) {
+                LOG_WARN("fail to get next row", KR(ret));
+              } else if (OB_UNLIKELY(OB_TASK_FINISH == ret)) {
+                LOG_INFO("TASK : HAS BEEN FINISHED !!!", K(task_id));
+              } else if (OB_UNLIKELY(OB_NEED_RETRY == ret)) {
+                ret = OB_SUCCESS;
+                continue;
+              }
+            } else if (OB_FAIL(row_caster.get_casted_row(*new_row, datum_row))) {
+              LOG_WARN("fail to cast row", KR(ret));
+            } else if (OB_FAIL(partition_writer_.append_row(datum_row))) {
+              LOG_WARN("fail to append row", KR(ret));
+            } else {
+              task_num++;
+            }
+          }
+          if (OB_UNLIKELY(OB_ITER_END == ret)) {
+            ret = OB_SUCCESS;
+          }
+          block_id++;
+        }
+
+        LOG_INFO("TASK block",K(thread_id), K(task_id), K(task_num), K(block_id), K(ret));
+      }
+
+      all_size += task_num;
+      LOG_INFO("TASK tt block",K(thread_id), K(task_id), K(task_num), K(block_id), K(ret));
+      
+      if (OB_UNLIKELY(ret == OB_ITER_END)) {
+        ret = OB_SUCCESS;
+        break;
+      } else if (OB_UNLIKELY(ret == OB_TASK_FINISH)) {
+        ret = OB_SUCCESS;
+      } else {
+        ret_.store(ret);
+        break;
+      }
+    }
+    if (OB_FAIL(ret)) {
+      ret_.store(ret);
+      LOG_WARN("loop err", KR(ret));
+    }
+  }
+
+  if (OB_FAIL(ret)) {
+    ret_.store(ret);
+  }
+  LOG_INFO("TASK all tt block",K(thread_id), K(all_size), K(ret));
+}
+
+
+/**
+ * ObLoadDataDirect
+ */
+
 int ObLoadDataDirect::execute(ObExecContext &ctx, ObLoadDataStmt &load_stmt)
 {
   int ret = OB_SUCCESS;
@@ -819,25 +991,16 @@ int ObLoadDataDirect::execute(ObExecContext &ctx, ObLoadDataStmt &load_stmt)
 
 int ObLoadDataDirect::inner_init(ObLoadDataStmt &load_stmt)
 {
-  int ret = OB_SUCCESS;
   const ObLoadArgument &load_args = load_stmt.get_load_arguments();
-  const ObIArray<ObLoadDataStmt::FieldOrVarStruct> &field_or_var_list =
-    load_stmt.get_field_or_var_list();
+  const auto &field_or_var_list = load_stmt.get_field_or_var_list();
   const uint64_t tenant_id = load_args.tenant_id_;
   const uint64_t table_id = load_args.table_id_;
   ObSchemaGetterGuard schema_guard;
   const ObTableSchema *table_schema = nullptr;
-
-  // split parittion
   std::string partition_directory = PARTITION_DIR + std::to_string(table_id);
-  if (OB_FAIL(partition_splitter_.init(load_stmt, partition_directory))) {
-    LOG_WARN("fail to init partition splitter", KR(ret));
-  } else if (OB_FAIL(partition_splitter_.split())) {
-    LOG_WARN("fail to split partition", KR(ret));
-  }
 
-  if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_tenant_schema_guard(tenant_id,
-                                                                                  schema_guard))) {
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_tenant_schema_guard(tenant_id, schema_guard))) {
     LOG_WARN("fail to get tenant schema guard", KR(ret), K(tenant_id));
   } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id, table_id, table_schema))) {
     LOG_WARN("fail to get table schema", KR(ret), K(tenant_id), K(table_id));
@@ -848,25 +1011,21 @@ int ObLoadDataDirect::inner_init(ObLoadDataStmt &load_stmt)
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("not support heap table", KR(ret));
   }
+  // init partition_splitter_
+  else if (OB_FAIL(partition_splitter_.init(load_stmt, table_schema, partition_directory))) {
+    LOG_WARN("fail to init partition splitter", KR(ret));
+  }
+  // split data
+  else if (OB_FAIL(partition_splitter_.split())) {
+    LOG_WARN("fail to split partition", KR(ret));
+  }
+  // init partition_reader_
   else if (OB_FAIL(partition_reader_.init(partition_directory, 0, PARTITION_NUM))) {
     LOG_WARN("fail to init partition reader", KR(ret));
-  }
-  // init csv_parser_
-  else if (OB_FAIL(csv_parser_.init(load_stmt.get_data_struct_in_file(), field_or_var_list.count(),
-                                    load_args.file_cs_type_))) {
-    LOG_WARN("fail to init csv parser", KR(ret));
-  }
-  // init file_reader_
-  else if (OB_FAIL(file_reader_.open(load_args.full_file_path_))) {
-    LOG_WARN("fail to open file", KR(ret), K(load_args.full_file_path_));
   }
   // init buffer_
   else if (OB_FAIL(buffer_.create(FILE_BUFFER_SIZE))) {
     LOG_WARN("fail to create buffer", KR(ret));
-  }
-  // init row_caster_
-  else if (OB_FAIL(row_caster_.init(table_schema, field_or_var_list))) {
-    LOG_WARN("fail to init row caster", KR(ret));
   }
   // init sort_
   else if (OB_FAIL(sort_.init(table_schema))) {
@@ -886,7 +1045,6 @@ int ObLoadDataDirect::do_load()
 
   bool last_round = false;
   while (OB_SUCC(ret) && last_round == false) {
-    sort_.reuse();
     while (OB_SUCC(ret)) {
       if (OB_FAIL(partition_reader_.read(datum_row))) {
         if (ret == OB_END_OF_PARTITION) {
@@ -922,6 +1080,7 @@ int ObLoadDataDirect::do_load()
         delete datum_row;
       }
     }
+    sort_.reuse();
   }
   
   if (OB_SUCC(ret)) {
