@@ -106,7 +106,7 @@ int ObLoadSequentialFileReader::open(const ObString &filepath)
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(file_reader_.open(filepath, false))) {
-    LOG_WARN("fail to open file", KR(ret));
+    LOG_WARN("fail to open file", KR(ret), K(filepath));
   }
   return ret;
 }
@@ -324,32 +324,8 @@ OB_DEF_SERIALIZE(ObLoadDatumRow)
   return ret;
 }
 
-int ObLoadDatumRow::deserialize(DESERIAL_PARAMS)
+OB_DEF_DESERIALIZE(ObLoadDatumRow)
 {
-  int ret = OK_;
-  int64_t version = 0;
-  int64_t len = 0;
-  if (OB_SUCC(ret)) {
-    OB_UNIS_DECODEx(version);
-    OB_UNIS_DECODEx(len);
-    if (OB_SUCC(ret)) {
-      if (version != UNIS_VERSION) {
-        ret = ::oceanbase::common::OB_NOT_SUPPORTED;
-        RPC_WARN("object version mismatch", "cls", "ObLoadDatumRow", K(ret), K(version));
-      } else if (len < 0) {
-        ret = ::oceanbase::common::OB_ERR_UNEXPECTED;
-        RPC_WARN("can't decode object with negative length", K(len));
-      } else if (data_len < len + pos) {
-        ret = ::oceanbase::common::OB_DESERIALIZE_ERROR;
-        RPC_WARN("buf length not enough", K(len), K(pos), K(data_len));
-      }
-    }
-  }
-  CALL_DESERIALIZE_(len, dispatch_, UNIS_HAS_COMPAT(ObLoadDatumRow));
-  return ret;
-}
-
-int ObLoadDatumRow::deserialize_(DESERIAL_PARAMS) {
   int ret = OB_SUCCESS;
   int64_t count = 0;
   OB_UNIS_DECODE(count);
@@ -582,97 +558,6 @@ int ObLoadRowCaster::cast_obj_to_datum(const ObColumnSchemaV2 *column_schema, co
 }
 
 /**
- * ObLoadExternalSort
- */
-
-ObLoadExternalSort::ObLoadExternalSort()
-  : allocator_(ObModIds::OB_SQL_LOAD_DATA), is_closed_(false), is_inited_(false)
-{
-}
-
-ObLoadExternalSort::~ObLoadExternalSort()
-{
-  external_sort_.clean_up();
-}
-
-int ObLoadExternalSort::init(const ObTableSchema *table_schema, int64_t mem_size,
-                             int64_t file_buf_size)
-{
-  int ret = OB_SUCCESS;
-  if (IS_INIT) {
-    ret = OB_INIT_TWICE;
-    LOG_WARN("ObLoadExternalSort init twice", KR(ret), KP(this));
-  } else if (OB_UNLIKELY(nullptr == table_schema)) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid args", KR(ret), KP(table_schema));
-  } else {
-    allocator_.set_tenant_id(MTL_ID());
-    const int64_t rowkey_column_num = table_schema->get_rowkey_column_num();
-    ObArray<ObColDesc> multi_version_column_descs;
-    if (OB_FAIL(table_schema->get_multi_version_column_descs(multi_version_column_descs))) {
-      LOG_WARN("fail to get multi version column descs", KR(ret));
-    } else if (OB_FAIL(datum_utils_.init(multi_version_column_descs, rowkey_column_num,
-                                         is_oracle_mode(), allocator_))) {
-      LOG_WARN("fail to init datum utils", KR(ret));
-    } else if (OB_FAIL(compare_.init(rowkey_column_num, &datum_utils_))) {
-      LOG_WARN("fail to init compare", KR(ret));
-    } else if (OB_FAIL(external_sort_.init(mem_size, file_buf_size, 0, MTL_ID(), &compare_))) {
-      LOG_WARN("fail to init external sort", KR(ret));
-    } else {
-      is_inited_ = true;
-    }
-  }
-  return ret;
-}
-
-int ObLoadExternalSort::append_row(const ObLoadDatumRow &datum_row)
-{
-  int ret = OB_SUCCESS;
-  if (IS_NOT_INIT) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("ObLoadExternalSort not init", KR(ret), KP(this));
-  } else if (OB_UNLIKELY(is_closed_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected closed external sort", KR(ret));
-  } else if (OB_FAIL(external_sort_.add_item(datum_row))) {
-    LOG_WARN("fail to add item", KR(ret));
-  }
-  return ret;
-}
-
-int ObLoadExternalSort::close()
-{
-  int ret = OB_SUCCESS;
-  if (IS_NOT_INIT) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("ObLoadExternalSort not init", KR(ret), KP(this));
-  } else if (OB_UNLIKELY(is_closed_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected closed external sort", KR(ret));
-  } else if (OB_FAIL(external_sort_.do_sort(true))) {
-    LOG_WARN("fail to do sort", KR(ret));
-  } else {
-    is_closed_ = true;
-  }
-  return ret;
-}
-
-int ObLoadExternalSort::get_next_row(const ObLoadDatumRow *&datum_row)
-{
-  int ret = OB_SUCCESS;
-  if (IS_NOT_INIT) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("ObLoadExternalSort not init", KR(ret), KP(this));
-  } else if (OB_UNLIKELY(!is_closed_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected not closed external sort", KR(ret));
-  } else if (OB_FAIL(external_sort_.get_next_item(datum_row))) {
-    LOG_WARN("fail to get next item", KR(ret));
-  }
-  return ret;
-}
-
-/**
  * ObLoadSSTableWriter
  */
 
@@ -819,10 +704,12 @@ int ObLoadSSTableWriter::append_row(const ObLoadDatumRow &datum_row)
         datum_row_.storage_datums_[i + extra_rowkey_column_num_] = datum_row.datums_[i];
       }
     }
-    int64_t pk1 = datum_row.datums_[0].get_int();
-    int64_t pk2 = datum_row.datums_[1].get_int();
-    LOG_INFO("append element: ", K(pk1), K(pk2), K((long)(&datum_row)));
+    // int64_t pk1 = datum_row.datums_[0].get_int();
+    // int64_t pk2 = datum_row.datums_[1].get_int();
+    // LOG_INFO("append element: ", K(pk1), K(pk2), K((long)(&datum_row)));
     if (OB_FAIL(macro_block_writer_.append_row(datum_row_))) {
+      int64_t pk1 = datum_row.datums_[0].get_int();
+      int64_t pk2 = datum_row.datums_[1].get_int();
       LOG_WARN("fail to append row", KR(ret), K(pk1), K(pk2));
     }
   }
@@ -981,9 +868,9 @@ int ObLoadDataDirect::inner_init(ObLoadDataStmt &load_stmt)
   else if (OB_FAIL(row_caster_.init(table_schema, field_or_var_list))) {
     LOG_WARN("fail to init row caster", KR(ret));
   }
-  // init external_sort_
-  else if (OB_FAIL(sort_.init(table_schema, MEM_BUFFER_SIZE, FILE_BUFFER_SIZE))) {
-    LOG_WARN("fail to init row caster", KR(ret));
+  // init sort_
+  else if (OB_FAIL(sort_.init(table_schema))) {
+    LOG_WARN("fail to init sort", KR(ret));
   }
   // init sstable_writer_
   else if (OB_FAIL(sstable_writer_.init(table_schema))) {
@@ -1002,16 +889,15 @@ int ObLoadDataDirect::do_load()
     sort_.reuse();
     while (OB_SUCC(ret)) {
       if (OB_FAIL(partition_reader_.read(datum_row))) {
-        if (ret == OB_EMPTY_RANGE) {
+        if (ret == OB_END_OF_PARTITION) {
           // all rows in this partition has been read
           break;
         } else if (ret == OB_ITER_END) {
           // all partitions have been read
-          // TODO
           last_round = true;
           break;
         } else {
-          LOG_WARN("fail to read partition row");
+          LOG_WARN("fail to read partition row with unexpected error", KR(ret));
         }
       } else if (OB_FAIL(sort_.append_row(datum_row))) {
         LOG_WARN("fail to append row", KR(ret));
@@ -1033,7 +919,6 @@ int ObLoadDataDirect::do_load()
       } else if (OB_FAIL(sstable_writer_.append_row(*datum_row))) {
         LOG_WARN("fail to append row", KR(ret));
       } else {
-        // TODO: correct?
         delete datum_row;
       }
     }
