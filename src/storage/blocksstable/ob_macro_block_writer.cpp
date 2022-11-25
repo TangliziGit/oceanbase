@@ -671,7 +671,6 @@ int ObMacroBlockWriter::check_order(const ObDatumRow &row)
     if (OB_SUCC(ret) && last_key_.is_valid()) {
       ObDatumRowkey cur_key;
       ObDatumRowkey last_key;
-      STORAGE_LOG(INFO, "FY BLOCK DEBUG.",K(cur_key), K(last_key));
       int32_t compare_result = 0;
       const ObStorageDatumUtils &datum_utils = read_info_.get_datum_utils();
 
