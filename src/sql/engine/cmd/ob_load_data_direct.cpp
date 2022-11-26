@@ -141,8 +141,9 @@ int ObLoadSequentialFileReader::open(const ObString &filepath)
   return ret;
 }
 
-int ObLoadSequentialFileReader::read_next_buffer(ObLoadDataBuffer &buffer)
+int ObLoadSequentialFileReader::read_next_buffer(ObLoadDataBuffer &buffer, int64_t offset)
 {
+  offset = (offset > 0)? offset: offset_;
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(!file_reader_.is_opened())) {
     ret = OB_FILE_NOT_OPENED;
@@ -150,7 +151,7 @@ int ObLoadSequentialFileReader::read_next_buffer(ObLoadDataBuffer &buffer)
   } else if (OB_LIKELY(buffer.get_remain_size() > 0)) {
     const int64_t buffer_remain_size = buffer.get_remain_size();
     int64_t read_size = 0;
-    if (OB_FAIL(file_reader_.pread(buffer.end(), buffer_remain_size, get_offset(buffer), read_size))) {
+    if (OB_FAIL(file_reader_.pread(buffer.end(), buffer_remain_size, offset, read_size))) {
       LOG_WARN("fail to do pread", KR(ret));
     } else if (read_size == 0) {
       // is_read_end_ = true;
@@ -909,7 +910,7 @@ void ObLoadDataSplitThreadPool::run1()
       while (OB_SUCC(ret)) {
         if (OB_FAIL(buffer.squash())) {
           LOG_WARN("fail to squash buffer", KR(ret));
-        } else if (OB_FAIL(file_reader_.read_next_buffer(buffer))) {
+        } else if (OB_FAIL(file_reader_.read_next_buffer(buffer, buffer.get_offset()))) {
           if (OB_UNLIKELY(OB_ITER_END == ret)) {
             if (OB_UNLIKELY(!buffer.empty())) {
               ret = OB_ERR_UNEXPECTED;
@@ -994,6 +995,7 @@ int ObLoadDataDirect::execute(ObExecContext &ctx, ObLoadDataStmt &load_stmt)
 
 int ObLoadDataDirect::inner_init(ObLoadDataStmt &load_stmt)
 {
+  LOG_INFO("start init");
   const ObLoadArgument &load_args = load_stmt.get_load_arguments();
   const auto &field_or_var_list = load_stmt.get_field_or_var_list();
   const uint64_t tenant_id = load_args.tenant_id_;
@@ -1023,7 +1025,7 @@ int ObLoadDataDirect::inner_init(ObLoadDataStmt &load_stmt)
     LOG_WARN("fail to split partition", KR(ret));
   }
   // init partition_reader_
-  else if (OB_FAIL(partition_reader_.init(partition_directory, 0, PARTITION_NUM))) {
+  else if (OB_FAIL(partition_reader_.init(partition_directory, 0, PARTITION_NUM - 1))) {
     LOG_WARN("fail to init partition reader", KR(ret));
   }
   // init buffer_
@@ -1043,6 +1045,7 @@ int ObLoadDataDirect::inner_init(ObLoadDataStmt &load_stmt)
 
 int ObLoadDataDirect::do_load()
 {
+  LOG_INFO("start load");
   int ret = OB_SUCCESS;
   ObLoadDatumRow *datum_row = nullptr;
 
@@ -1092,6 +1095,7 @@ int ObLoadDataDirect::do_load()
     }
   }
 
+  LOG_INFO("load done");
   return ret;
 }
 

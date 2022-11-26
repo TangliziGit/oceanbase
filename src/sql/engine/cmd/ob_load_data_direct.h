@@ -7,8 +7,7 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <atomic>
-#include "map"
-#include "fstream"
+#include <unordered_map>
 #include "lib/file/ob_file.h"
 #include "lib/timezone/ob_timezone_info.h"
 #include "sql/engine/cmd/ob_load_data_impl.h"
@@ -30,7 +29,7 @@ static const char * PARTITION_DIR = "./load-partition/";
 static constexpr int64_t TASK_SIZE = (1LL << 28); // 256M
 static constexpr int64_t MEM_BUFFER_SIZE = (1LL << 30); // 1G
 static constexpr int64_t SORT_BUFFER_SIZE = 4 * (1LL << 30); // 4G
-static constexpr int64_t N_CPU = 4;
+static constexpr int64_t N_CPU = 16;
 
 // additional error code `OB_END_OF_PARTITION`,
 // which means this partition has been read through,
@@ -42,8 +41,6 @@ namespace oceanbase
 {
 namespace sql
 {
-    // TODO
-constexpr int64_t FILE_BUFFER_SIZE = (2LL << 20); // 2M
 
 class ObLoadDataBuffer
 {
@@ -99,11 +96,8 @@ public:
   ~ObLoadSequentialFileReader();
   int open(const ObString &filepath);
   void close() { file_reader_.close(); offset_ = 0; }
-  int read_next_buffer(ObLoadDataBuffer &buffer);
+  int read_next_buffer(ObLoadDataBuffer &buffer, int64_t offset = -1);
 private:
-  int64_t get_offset(ObLoadDataBuffer &buffer) { return offset_; }
-  int64_t get_offset(ObLoadFileDataBuffer &buffer) { return buffer.get_offset(); }
-
   common::ObFileReader file_reader_;
   int64_t offset_;
   bool is_read_end_;
@@ -233,6 +227,7 @@ private:
 class ObPartitionWriter
 {
 public:
+  using BufferFileAppender = common::FileComponent::BufferFileAppender;
   ObPartitionWriter() {}
 
   int init(const std::string& partition_directory) {
@@ -253,33 +248,39 @@ public:
     int64_t pos = 0;
     int ret = datum_row->serialize(buf, 1024, pos);
 
-    partition_stream(key)->write(buf, pos);
+    get_appender(key)->append(buf, pos, false);
     lock_.unlock();
     return ret;
   }
 
   void close() {
-    for (auto &pair: streams_) {
+    for (auto &pair: appenders_) {
       pair.second->close();
+      delete pair.second;
     }
+    appenders_.clear();
   }
 
 private:
-  std::ofstream *partition_stream(int64_t key) {
-    std::string file_path = partition_directory_ + "/" + std::to_string(key);
-    auto iter = streams_.find(file_path);
-    if (iter != streams_.end()) {
+  BufferFileAppender *get_appender(int64_t key) {
+    auto iter = appenders_.find(key);
+    if (iter != appenders_.end()) {
       return iter->second;
     }
 
-    auto stream = new std::ofstream(file_path, std::ios::app);
-    streams_[file_path] = stream;
-    return stream;
+    auto appender = new BufferFileAppender();
+    int ret = OB_SUCCESS;
+    common::ObString file_path{ (partition_directory_ + "/" + std::to_string(key)).c_str() };
+    if (OB_FAIL(appender->create(file_path))) {
+      LOG_WARN("fail to create partitoin file", KR(ret), K(file_path));
+    }
+    appenders_[key] = appender;
+    return appender;
   }
 
   common::ObSpinLock lock_;
   std::string partition_directory_;
-  std::map<std::string, std::ofstream *> streams_;
+  std::unordered_map<int64_t, BufferFileAppender*> appenders_;
 };
 
 // TODO: parallel optimize
@@ -543,6 +544,7 @@ public:
 
   int close() {
     std::sort(datum_rows_.begin(), datum_rows_.end(), compare_);
+    LOG_INFO("sorted item size", K(datum_rows_.size()));
     return OB_SUCCESS;
   }
 
