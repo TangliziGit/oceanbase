@@ -30,7 +30,7 @@ static const char * PARTITION_DIR = "./load-partition/";
 static constexpr int64_t TASK_SIZE = (1LL << 28); // 256M
 static constexpr int64_t MEM_BUFFER_SIZE = (1LL << 30); // 1G
 static constexpr int64_t SORT_BUFFER_SIZE = 4 * (1LL << 30); // 4G
-static constexpr int64_t N_CPU = 16;
+static constexpr int64_t N_CPU = 4;
 
 // additional error code `OB_END_OF_PARTITION`,
 // which means this partition has been read through,
@@ -245,7 +245,7 @@ public:
   }
 
   int append_row(const ObLoadDatumRow *&datum_row) {
-    // TODO: thread safty
+    lock_.lock();
     // TODO: select pk via StorageDatumUtils
     int64_t key = gen_key(datum_row->datums_[0].get_int());
 
@@ -254,6 +254,7 @@ public:
     int ret = datum_row->serialize(buf, 1024, pos);
 
     partition_stream(key)->write(buf, pos);
+    lock_.unlock();
     return ret;
   }
 
@@ -276,6 +277,7 @@ private:
     return stream;
   }
 
+  common::ObSpinLock lock_;
   std::string partition_directory_;
   std::map<std::string, std::ofstream *> streams_;
 };
@@ -429,7 +431,7 @@ private:
   ObLoadDataStmt *load_stmt_;
   const ObTableSchema *table_schema_;
 
-  ObLoadSequentialFileReader *file_reader_;
+  ObLoadSequentialFileReader file_reader_;
   ObPartitionWriter partition_writer_;
 
   common::ObSpinLock lock_;

@@ -218,6 +218,8 @@ int ObLoadCSVPaser::get_next_row(ObLoadFileDataBuffer &buffer, const ObNewRow *&
   row = nullptr;
   if (buffer.empty()) {
     ret = OB_ITER_END;
+    LOG_WARN("fail to get next row because buffer is empty",
+             KR(ret), K(buffer.get_data_size()), K(buffer.get_file_pos()), K(buffer.get_offset()));
   } else {
     const char *str = buffer.begin();
     const char *end = buffer.end();
@@ -236,6 +238,7 @@ int ObLoadCSVPaser::get_next_row(ObLoadFileDataBuffer &buffer, const ObNewRow *&
       LOG_WARN("fail to parse line", KR(ret));
     } else if (0 == nrows) {
       ret = OB_ITER_END;
+      LOG_WARN("end of file", KR(ret));
     } else if (buffer.is_compete()) {
       ret = OB_TASK_FINISH;
       LOG_INFO("TASK FINISH .", K(buffer.get_file_pos()));    
@@ -854,7 +857,7 @@ int ObLoadDataSplitThreadPool::init(ObLoadDataStmt *load_stmt,
 
   int ret = OB_SUCCESS;
   const ObLoadArgument &load_args = load_stmt->get_load_arguments();
-  if (OB_FAIL(file_reader_->open(load_args.full_file_path_))) {
+  if (OB_FAIL(file_reader_.open(load_args.full_file_path_))) {
     LOG_WARN("fail to open file", KR(ret), K(load_args.full_file_path_));
   } else if (OB_FAIL(partition_writer_.init(partition_directory))) {
     LOG_WARN("fail to init partition writer", KR(ret));
@@ -906,7 +909,7 @@ void ObLoadDataSplitThreadPool::run1()
       while (OB_SUCC(ret)) {
         if (OB_FAIL(buffer.squash())) {
           LOG_WARN("fail to squash buffer", KR(ret));
-        } else if (OB_FAIL(file_reader_->read_next_buffer(buffer))) {
+        } else if (OB_FAIL(file_reader_.read_next_buffer(buffer))) {
           if (OB_UNLIKELY(OB_ITER_END == ret)) {
             if (OB_UNLIKELY(!buffer.empty())) {
               ret = OB_ERR_UNEXPECTED;
