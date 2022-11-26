@@ -887,7 +887,7 @@ void ObLoadDataSplitThreadPool::run1()
     ObLoadRowCaster row_caster;
 
     // init buffer
-    if (OB_FAIL(buffer.create(FILE_BUFFER_SIZE, task_id))) {
+    if (OB_FAIL(buffer.create(FILE_DATA_BUFFER_SIZE, task_id))) {
       LOG_WARN("fail to create buffer", KR(ret));
     }
     // TODO: unnecessary initialization
@@ -1027,10 +1027,6 @@ int ObLoadDataDirect::inner_init(ObLoadDataStmt &load_stmt)
   // init partition_reader_
   else if (OB_FAIL(partition_reader_.init(partition_directory, 0, PARTITION_NUM - 1))) {
     LOG_WARN("fail to init partition reader", KR(ret));
-  }
-  // init buffer_
-  else if (OB_FAIL(buffer_.create(FILE_BUFFER_SIZE))) {
-    LOG_WARN("fail to create buffer", KR(ret));
   }
   // init sort_
   else if (OB_FAIL(sort_.init(table_schema))) {

@@ -7,7 +7,6 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <atomic>
-#include <unordered_map>
 #include "lib/file/ob_file.h"
 #include "lib/timezone/ob_timezone_info.h"
 #include "sql/engine/cmd/ob_load_data_impl.h"
@@ -19,7 +18,8 @@
 #include "lib/lock/ob_spin_lock.h"
 #include "common/ob_clock_generator.h"
 
-static constexpr int64_t FILE_BUFFER_SIZE = (200LL << 20); // 200M
+static constexpr int64_t FILE_DATA_BUFFER_SIZE = (2LL << 20); // 2M
+static constexpr int64_t DATA_BUFFER_SIZE = (200LL << 20); // 200M
 static constexpr int64_t PARTITION_NUM = 400;
 static constexpr int64_t PK_MIN = 1;
 static constexpr int64_t PK_MAX = 300000000;
@@ -30,6 +30,7 @@ static constexpr int64_t TASK_SIZE = (1LL << 28); // 256M
 static constexpr int64_t MEM_BUFFER_SIZE = (1LL << 30); // 1G
 static constexpr int64_t SORT_BUFFER_SIZE = 4 * (1LL << 30); // 4G
 static constexpr int64_t N_CPU = 16;
+static constexpr int64_t N_LOCK_SHARD = PARTITION_NUM;
 
 // additional error code `OB_END_OF_PARTITION`,
 // which means this partition has been read through,
@@ -231,16 +232,18 @@ public:
   ObPartitionWriter() {}
 
   int init(const std::string& partition_directory) {
-    partition_directory_ = partition_directory;
-    return OB_SUCCESS;
-  }
-
-  static int64_t gen_key(int64_t pk) {
-    return (pk - PK_MIN) / PK_SPAN;
+    int ret = OB_SUCCESS;
+    for (int64_t i=0; i<PARTITION_NUM; i++) {
+      common::ObString file_path{ (partition_directory + "/" + std::to_string(i)).c_str() };
+      if (OB_FAIL(appenders_[i].create(file_path))) {
+        LOG_WARN("fail to create partitoin file", KR(ret), K(file_path));
+        break;
+      }
+    }
+    return ret;
   }
 
   int append_row(const ObLoadDatumRow *&datum_row) {
-    lock_.lock();
     // TODO: select pk via StorageDatumUtils
     int64_t key = gen_key(datum_row->datums_[0].get_int());
 
@@ -248,39 +251,23 @@ public:
     int64_t pos = 0;
     int ret = datum_row->serialize(buf, 1024, pos);
 
-    get_appender(key)->append(buf, pos, false);
-    lock_.unlock();
+    auto &lock = lock_[key % N_LOCK_SHARD];
+    lock.lock();
+    appenders_[key].append(buf, pos, false);
+    lock.unlock();
     return ret;
   }
 
   void close() {
-    for (auto &pair: appenders_) {
-      pair.second->close();
-      delete pair.second;
-    }
-    appenders_.clear();
+    for (auto &appender: appenders_)
+      appender.close();
   }
 
 private:
-  BufferFileAppender *get_appender(int64_t key) {
-    auto iter = appenders_.find(key);
-    if (iter != appenders_.end()) {
-      return iter->second;
-    }
+  static OB_INLINE int64_t gen_key(int64_t pk) { return (pk - PK_MIN) / PK_SPAN; }
 
-    auto appender = new BufferFileAppender();
-    int ret = OB_SUCCESS;
-    common::ObString file_path{ (partition_directory_ + "/" + std::to_string(key)).c_str() };
-    if (OB_FAIL(appender->create(file_path))) {
-      LOG_WARN("fail to create partitoin file", KR(ret), K(file_path));
-    }
-    appenders_[key] = appender;
-    return appender;
-  }
-
-  common::ObSpinLock lock_;
-  std::string partition_directory_;
-  std::unordered_map<int64_t, BufferFileAppender*> appenders_;
+  common::ObSpinLock lock_[N_LOCK_SHARD];
+  BufferFileAppender appenders_[PARTITION_NUM];
 };
 
 // TODO: parallel optimize
@@ -297,7 +284,7 @@ public:
     next_file_id_ = range_min_;
 
     int ret = OB_SUCCESS;
-    if (OB_FAIL(buffer_.create(FILE_BUFFER_SIZE))) {
+    if (OB_FAIL(buffer_.create(DATA_BUFFER_SIZE))) {
       LOG_WARN("fail to create buffer during partition reader init", KR(ret));
     } else if (OB_FAIL(open_next_partition())) {
       LOG_WARN("fail to open next partition", KR(ret));
@@ -452,23 +439,25 @@ public:
     mkdir(partition_directory.c_str(), S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
 
     int ret = OB_SUCCESS;
-    if (OB_FAIL(split_pool_.init(&load_stmt, table_schema, partition_directory))) {
+    split_pool_ = new ObLoadDataSplitThreadPool();
+    if (OB_FAIL(split_pool_->init(&load_stmt, table_schema, partition_directory))) {
       LOG_WARN("fail to init data split thread pool", KR(ret));
     }
     return ret;
   }
 
   int split() {
-    split_pool_.set_thread_count(N_CPU);
-    split_pool_.set_run_wrapper(MTL_CTX());
-    split_pool_.start();
-    split_pool_.wait();
-    split_pool_.close();
+    split_pool_->set_thread_count(N_CPU);
+    split_pool_->set_run_wrapper(MTL_CTX());
+    split_pool_->start();
+    split_pool_->wait();
+    split_pool_->close();
 
     int ret = OB_SUCCESS;
-    if (OB_FAIL(split_pool_.get_res())) {
+    if (OB_FAIL(split_pool_->get_res())) {
       LOG_WARN("controller read err.", K(ret));
     }
+    delete split_pool_;
     return ret;
   }
 
@@ -491,7 +480,7 @@ private:
   }
 
 private:
-  ObLoadDataSplitThreadPool split_pool_;
+  ObLoadDataSplitThreadPool *split_pool_{nullptr};
 };
 
 class ObLoadSort
@@ -579,7 +568,6 @@ private:
 private:
     ObLoadDataSplitter partition_splitter_;
     ObPartitionReader partition_reader_;
-    ObLoadDataBuffer buffer_;
     ObLoadSort sort_;
     ObLoadSSTableWriter sstable_writer_;
 };
