@@ -653,8 +653,6 @@ int ObLoadSSTableWriter::init(const ObTableSchema *table_schema)
       LOG_WARN("fail to get tablet handle", KR(ret), K(tablet_id_));
     } else if (OB_FAIL(init_sstable_index_builder(table_schema))) {
       LOG_WARN("fail to init sstable index builder", KR(ret));
-    } else if (OB_FAIL(init_macro_block_writer(table_schema))) {
-      LOG_WARN("fail to init macro block writer", KR(ret));
     } else if (OB_FAIL(datum_row_.init(column_count_ + extra_rowkey_column_num_))) {
       LOG_WARN("fail to init datum row", KR(ret));
     } else {
@@ -710,9 +708,10 @@ int ObLoadSSTableWriter::init_sstable_index_builder(const ObTableSchema *table_s
   return ret;
 }
 
-int ObLoadSSTableWriter::init_macro_block_writer(const ObTableSchema *table_schema)
+int ObLoadSSTableWriter::reuse_macro_block_writer(const int index,const int64_t task_id, const share::schema::ObTableSchema *table_schema)
 {
   int ret = OB_SUCCESS;
+  macro_block_writers_[index].reset();
   if (OB_FAIL(data_store_desc_.init(*table_schema, ls_id_, tablet_id_, MAJOR_MERGE, 1))) {
     LOG_WARN("fail to init data_store_desc", KR(ret), K(tablet_id_));
   } else {
@@ -720,14 +719,24 @@ int ObLoadSSTableWriter::init_macro_block_writer(const ObTableSchema *table_sche
   }
   if (OB_SUCC(ret)) {
     ObMacroDataSeq data_seq;
-    if (OB_FAIL(macro_block_writer_.open(data_store_desc_, data_seq))) {
+    data_seq.set_parallel_degree(task_id * 1000);
+    if (OB_FAIL(macro_block_writers_[index].open(data_store_desc_, data_seq))) {
       LOG_WARN("fail to init macro block writer", KR(ret), K(data_store_desc_), K(data_seq));
     }
   }
   return ret;
 }
 
-int ObLoadSSTableWriter::append_row(const ObLoadDatumRow &datum_row)
+int ObLoadSSTableWriter::close_macro_block_writer(const int index) 
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(macro_block_writers_[index].close())) {
+    LOG_WARN("fail to close macro block writer", KR(ret));
+  } 
+  return ret;
+}
+
+int ObLoadSSTableWriter::append_row(const int index, const ObLoadDatumRow &datum_row)
 {
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
@@ -750,7 +759,7 @@ int ObLoadSSTableWriter::append_row(const ObLoadDatumRow &datum_row)
     // int64_t pk1 = datum_row.datums_[0].get_int();
     // int64_t pk2 = datum_row.datums_[1].get_int();
     // LOG_INFO("append element: ", K(pk1), K(pk2), K((long)(&datum_row)));
-    if (OB_FAIL(macro_block_writer_.append_row(datum_row_))) {
+    if (OB_FAIL(macro_block_writers_[index].append_row(datum_row_))) {
       int64_t pk1 = datum_row.datums_[0].get_int();
       int64_t pk2 = datum_row.datums_[1].get_int();
       LOG_WARN("fail to append row", KR(ret), K(pk1), K(pk2));
@@ -838,9 +847,7 @@ int ObLoadSSTableWriter::close()
     LOG_WARN("unexpected closed sstable writer", KR(ret));
   } else {
     ObSSTable *sstable = nullptr;
-    if (OB_FAIL(macro_block_writer_.close())) {
-      LOG_WARN("fail to close macro block writer", KR(ret));
-    } else if (OB_FAIL(create_sstable())) {
+    if (OB_FAIL(create_sstable())) {
       LOG_WARN("fail to create sstable", KR(ret));
     } else {
       is_closed_ = true;
@@ -977,6 +984,73 @@ void ObLoadDataSplitThreadPool::run1()
   LOG_INFO("TASK all tt block",K(thread_id), K(all_size), K(ret));
 }
 
+void ObSStableWriterThreadPool::run1()
+{
+  ObTenantStatEstGuard stat_est_guard(MTL_ID());
+  ObTenantBase *tenant_base = MTL_CTX();
+  Worker::CompatMode mode = ((ObTenant*)tenant_base)->get_compat_mode();
+  Worker::set_compatibility_mode(mode);
+  // TODO
+  const int64_t thread_id = (const int64_t)(this->get_thread_idx());
+  int ret = OB_SUCCESS;
+  int64_t all_size = 0;
+  while (OB_SUCC(ret_.load())) {
+    int32_t task_id = get_task();
+    if (task_id > max_id_) {
+      break;
+    }
+    ObLoadDatumRow *datum_row = nullptr;
+    ObLoadSort load_sort;
+    ObPartitionReader partition_reader;
+    if (OB_FAIL(sstable_writer_.reuse_macro_block_writer(thread_id, task_id, table_schema_))) {
+      LOG_WARN("fail to reuse the sstable writer.", K(ret), K(thread_id), K(task_id));
+    } else if (OB_FAIL(partition_reader.init(partition_directory_, task_id))) {
+      LOG_WARN("fail to init the partition reader.", K(ret), K(thread_id), K(task_id));
+    } else if (OB_FAIL(load_sort.init(table_schema_))) {
+      LOG_WARN("fail to init the sort.", K(ret), K(thread_id), K(task_id));
+    } else {
+      while (OB_SUCC(ret)) {
+        if (OB_FAIL(partition_reader.read(datum_row))) {
+          if (ret != OB_END_OF_PARTITION) {
+            LOG_WARN("fail to read the next row of partition reader.", K(ret), K(thread_id), K(task_id));
+          } else {
+            ret = OB_SUCCESS;
+            break;
+          }
+        } else if (OB_FAIL(load_sort.append_row(datum_row))) {
+          LOG_WARN("fail to append row to the sort.", K(ret), K(thread_id), K(task_id));
+        }
+      }
+      if (OB_SUCC(ret)) {
+        if (OB_FAIL(load_sort.close())) {
+          LOG_WARN("fail to close the sort.", K(ret), K(thread_id), K(task_id));
+        }
+      }
+      while (OB_SUCC(ret)) {
+        if (OB_FAIL(load_sort.get_next_row(datum_row))) {
+          if (ret == OB_ITER_END) {
+            // all rows in this partition has been read
+            LOG_INFO("sstable write task finished ", K(ret), K(thread_id), K(task_id));
+            ret = OB_SUCCESS;
+            break;
+          } else {
+            LOG_WARN("fail to read partition row with unexpected error", KR(ret));
+          }
+        } else if (OB_FAIL(sstable_writer_.append_row(thread_id, *datum_row))) {
+          LOG_WARN("fail to append to the sstable", K(ret), K(thread_id), K(task_id));
+        }
+      }
+      if (OB_SUCC(ret)) {
+        if (OB_FAIL(sstable_writer_.close_macro_block_writer(thread_id))) {
+          LOG_WARN("fail to close the macro_block.", K(ret), K(thread_id), K(task_id));
+        }
+      }
+    }
+    if (OB_FAIL(ret)) {
+      ret_.store(ret);
+    }
+  }
+}
 
 /**
  * ObLoadDataDirect
@@ -1024,16 +1098,8 @@ int ObLoadDataDirect::inner_init(ObLoadDataStmt &load_stmt)
   else if (OB_FAIL(partition_splitter_.split())) {
     LOG_WARN("fail to split partition", KR(ret));
   }
-  // init partition_reader_
-  else if (OB_FAIL(partition_reader_.init(partition_directory, 0, PARTITION_NUM - 1))) {
-    LOG_WARN("fail to init partition reader", KR(ret));
-  }
-  // init sort_
-  else if (OB_FAIL(sort_.init(table_schema))) {
-    LOG_WARN("fail to init sort", KR(ret));
-  }
   // init sstable_writer_
-  else if (OB_FAIL(sstable_writer_.init(table_schema))) {
+  else if (OB_FAIL(sstable_writer_thread_pool_.init(table_schema, partition_directory, 0, PARTITION_NUM - 1))) {
     LOG_WARN("fail to init sstable writer", KR(ret));
   }
   return ret;
@@ -1043,50 +1109,12 @@ int ObLoadDataDirect::do_load()
 {
   LOG_INFO("start load");
   int ret = OB_SUCCESS;
-  ObLoadDatumRow *datum_row = nullptr;
-
-  bool last_round = false;
-  while (OB_SUCC(ret) && last_round == false) {
-    while (OB_SUCC(ret)) {
-      if (OB_FAIL(partition_reader_.read(datum_row))) {
-        if (ret == OB_END_OF_PARTITION) {
-          // all rows in this partition has been read
-          break;
-        } else if (ret == OB_ITER_END) {
-          // all partitions have been read
-          last_round = true;
-          break;
-        } else {
-          LOG_WARN("fail to read partition row with unexpected error", KR(ret));
-        }
-      } else if (OB_FAIL(sort_.append_row(datum_row))) {
-        LOG_WARN("fail to append row", KR(ret));
-      }
-    }
-
-    if (OB_FAIL(sort_.close())) {
-      LOG_WARN("fail to close external sort", KR(ret));
-    }
-
-    while (OB_SUCC(ret)) {
-      if (OB_FAIL(sort_.get_next_row(datum_row))) {
-        if (OB_UNLIKELY(OB_ITER_END != ret)) {
-          LOG_WARN("fail to get next row", KR(ret));
-        } else {
-          ret = OB_SUCCESS;
-          break;
-        }
-      } else if (OB_FAIL(sstable_writer_.append_row(*datum_row))) {
-        LOG_WARN("fail to append row", KR(ret));
-      } else {
-        delete datum_row;
-      }
-    }
-    sort_.reuse();
-  }
-  
-  if (OB_SUCC(ret)) {
-    if (OB_FAIL(sstable_writer_.close())) {
+  sstable_writer_thread_pool_.set_thread_count(1);
+  sstable_writer_thread_pool_.set_run_wrapper(MTL_CTX());
+  sstable_writer_thread_pool_.start();
+  sstable_writer_thread_pool_.wait();
+  if (OB_SUCC(sstable_writer_thread_pool_.get_res())) {
+    if (OB_FAIL(sstable_writer_thread_pool_.close())) {
       LOG_WARN("fail to close sstable writer", KR(ret));
     }
   }

@@ -200,11 +200,13 @@ public:
   ObLoadSSTableWriter();
   ~ObLoadSSTableWriter();
   int init(const share::schema::ObTableSchema *table_schema);
-  int append_row(const ObLoadDatumRow &datum_row);
+  int reuse_macro_block_writer(const int index, const int64_t task_id, const share::schema::ObTableSchema *table_schema);
+  int close_macro_block_writer(const int index);
+  int append_row(const int index, const ObLoadDatumRow &datum_row);
   int close();
 private:
   int init_sstable_index_builder(const share::schema::ObTableSchema *table_schema);
-  int init_macro_block_writer(const share::schema::ObTableSchema *table_schema);
+  // int init_macro_block_writer(int index, int task_id,const share::schema::ObTableSchema *table_schema);
   int create_sstable();
 private:
   common::ObTabletID tablet_id_;
@@ -217,7 +219,7 @@ private:
   storage::ObITable::TableKey table_key_;
   blocksstable::ObSSTableIndexBuilder sstable_index_builder_;
   blocksstable::ObDataStoreDesc data_store_desc_;
-  blocksstable::ObMacroBlockWriter macro_block_writer_;
+  blocksstable::ObMacroBlockWriter macro_block_writers_[N_CPU];
   blocksstable::ObDatumRow datum_row_;
   bool is_closed_;
   bool is_inited_;
@@ -277,16 +279,14 @@ public:
   ObPartitionReader() {}
 
   // read partitions includes [range_min, range_max]
-  int init(std::string partition_directory, int64_t range_min, int64_t range_max) {
+  int init(std::string partition_directory, int64_t partition_id) {
     partition_directory_ = partition_directory;
-    range_min_ = range_min;
-    range_max_ = range_max;
-    next_file_id_ = range_min_;
+    partition_id_ = partition_id;
 
     int ret = OB_SUCCESS;
     if (OB_FAIL(buffer_.create(DATA_BUFFER_SIZE))) {
       LOG_WARN("fail to create buffer during partition reader init", KR(ret));
-    } else if (OB_FAIL(open_next_partition())) {
+    } else if (OB_FAIL(open_partition())) {
       LOG_WARN("fail to open next partition", KR(ret));
     } else if (OB_FAIL(read_next_buffer())) {
       LOG_WARN("fail to read next buffer", KR(ret));
@@ -311,14 +311,6 @@ public:
     if (ret == OB_END_OF_PARTITION) {
       delete datum_row;
       datum_row = nullptr;
-
-      if (OB_FAIL(open_next_partition())) {
-        LOG_INFO("all partitions have been read", KR(ret));
-        return OB_ITER_END;
-      }
-      // NOTE: why not read next buffer immediately?
-      //  Because `datum_row->datums_[*].ptr` point to the memory in buffer.
-      //  Once reuse the buffer, the content of datum_row->datums_ will be changed.
       LOG_INFO("current partition file has been read", KR(ret));
       return OB_END_OF_PARTITION;
     }
@@ -339,7 +331,7 @@ public:
       return ret;
     }
     LOG_WARN("fail to deserialize after read buffer successfully",
-             KR(ret), K(buffer_.get_data_size()), K(buffer_.get_remain_size()), K(next_file_id_ - 1));
+             KR(ret), K(buffer_.get_data_size()), K(buffer_.get_remain_size()), K(partition_id_));
     return ret;
   }
 
@@ -367,36 +359,20 @@ private:
     return ret;
   }
 
-  int open_next_partition() {
+  int open_partition() {
     int ret = OB_SUCCESS;
-    int i = next_file_id_;
-    for (; i <= range_max_; i++) {
-      std::string file_path = partition_directory_ + "/" + std::to_string(i);
-      ObString path{file_path.c_str()};
-
-      file_reader_.close();
-      if (OB_SUCC(file_reader_.open(path))) break;
-      if (ret == OB_FILE_NOT_EXIST) {
-        LOG_INFO("");
-      }
-      LOG_WARN("fail to open next partition file with unexpected error", KR(ret));
+    std::string file_path = partition_directory_ + "/" + std::to_string(partition_id_);
+    ObString path{file_path.c_str()};
+    if (OB_SUCC(file_reader_.open(path))) {
+      LOG_WARN("fail to open partition file.", K(ret), K(partition_id));
     }
-
-    if (i > range_max_) {
-      next_file_id_ = range_max_ + 1;
-      return OB_ITER_END;
-    }
-    buffer_.reuse();
-    next_file_id_ = i+1;
-    LOG_INFO("open partition file successfully", K(next_file_id_));
+    LOG_INFO("open partition file successfully", K(partition_id_));
     return ret;
   }
 
 private:
   std::string partition_directory_;
-  int64_t range_min_;
-  int64_t range_max_;
-  int64_t next_file_id_;
+  int64_t partition_id_;
   ObLoadSequentialFileReader file_reader_;
   ObLoadDataBuffer buffer_;
 };
@@ -424,6 +400,37 @@ private:
 
   common::ObSpinLock lock_;
   std::atomic<int32_t> task_id_ = {0};
+  std::atomic<int> ret_ = {0};
+};
+
+class ObSStableWriterThreadPool : public share::ObThreadPool {
+public:
+  ObSStableWriterThreadPool() {}
+  ~ObSStableWriterThreadPool() {}
+public:
+  virtual void run1();
+  int init(const ObTableSchema *table_schema, std::string partition_directory, int64_t min_id, int64_t max_id) {
+    int ret = OB_SUCCESS;
+    if (OB_FAIL(sstable_writer_.init(table_schema))) {
+      LOG_WARN("fail to init sstable.", K(ret));
+    } else {
+      table_schema_ = table_schema;
+      partition_directory_ = partition_directory;
+      max_id_ = max_id;
+      task_id_.store(min_id);
+    }
+    return ret;
+  }
+  int close() { return sstable_writer_.close(); };
+  int get_res() const { return ret_.load(); }
+  int32_t get_task() { return task_id_.fetch_add(1); }
+private:
+  int64_t max_id_;
+  const ObTableSchema *table_schema_;
+  ObLoadSSTableWriter sstable_writer_;
+
+  std::string partition_directory_;
+  std::atomic<int64_t> task_id_ = {0};
   std::atomic<int> ret_ = {0};
 };
 
@@ -553,7 +560,6 @@ private:
   bool is_inited_ = false;
 };
 
-
 class ObLoadDataDirect : public ObLoadDataBase
 {
     static const int64_t MEM_BUFFER_SIZE = (1LL << 30); // 1G
@@ -567,9 +573,7 @@ private:
     int do_load();
 private:
     ObLoadDataSplitter partition_splitter_;
-    ObPartitionReader partition_reader_;
-    ObLoadSort sort_;
-    ObLoadSSTableWriter sstable_writer_;
+    ObSStableWriterThreadPool sstable_writer_thread_pool_;
 };
 } // namespace sql
 } // namespace oceanbase
