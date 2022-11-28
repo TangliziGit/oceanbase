@@ -655,6 +655,8 @@ int ObLoadSSTableWriter::init(const ObTableSchema *table_schema)
       LOG_WARN("fail to init sstable index builder", KR(ret));
     } else if (OB_FAIL(datum_row_.init(column_count_ + extra_rowkey_column_num_))) {
       LOG_WARN("fail to init datum row", KR(ret));
+    } else if (OB_FAIL(data_store_desc_.init(*table_schema, ls_id_, tablet_id_, MAJOR_MERGE, 1))) {
+      LOG_WARN("fail to init data_store_desc", KR(ret), K(tablet_id_));
     } else {
       table_key_.table_type_ = ObITable::MAJOR_SSTABLE;
       table_key_.tablet_id_ = tablet_id_;
@@ -664,6 +666,7 @@ int ObLoadSSTableWriter::init(const ObTableSchema *table_schema)
       datum_row_.mvcc_row_flag_.set_last_multi_version_row(true);
       datum_row_.storage_datums_[rowkey_column_num_].set_int(-1); // fill trans_version
       datum_row_.storage_datums_[rowkey_column_num_ + 1].set_int(0); // fill sql_no
+      data_store_desc_.sstable_index_builder_ = &sstable_index_builder_;
       is_inited_ = true;
     }
   }
@@ -712,11 +715,6 @@ int ObLoadSSTableWriter::reuse_macro_block_writer(const int index,const int64_t 
 {
   int ret = OB_SUCCESS;
   macro_block_writers_[index].reset();
-  if (OB_FAIL(data_store_desc_.init(*table_schema, ls_id_, tablet_id_, MAJOR_MERGE, 1))) {
-    LOG_WARN("fail to init data_store_desc", KR(ret), K(tablet_id_));
-  } else {
-    data_store_desc_.sstable_index_builder_ = &sstable_index_builder_;
-  }
   if (OB_SUCC(ret)) {
     ObMacroDataSeq data_seq;
     data_seq.set_parallel_degree(task_id * 1000);
@@ -883,7 +881,7 @@ void ObLoadDataSplitThreadPool::run1()
   const ObLoadArgument &load_args = load_stmt_->get_load_arguments();
   const auto &field_or_var_list = load_stmt_->get_field_or_var_list();
   const int64_t thread_id = (const int64_t)(this->get_thread_idx());
-  LOG_INFO("data split start" , K(thread_id));
+  LOG_INFO("data split start" , K(thread_id), K(MTL_ID()));
 
   int ret = OB_SUCCESS;
   int all_size = 0;
@@ -999,12 +997,13 @@ void ObSStableWriterThreadPool::run1()
     if (task_id > max_id_) {
       break;
     }
+    LOG_INFO("load task start.", K(ret), K(thread_id), K(task_id));
     ObLoadDatumRow *datum_row = nullptr;
     ObLoadSort load_sort;
     ObPartitionReader partition_reader;
     if (OB_FAIL(sstable_writer_.reuse_macro_block_writer(thread_id, task_id, table_schema_))) {
       LOG_WARN("fail to reuse the sstable writer.", K(ret), K(thread_id), K(task_id));
-    } else if (OB_FAIL(partition_reader.init(partition_directory_, task_id))) {
+    } else if (OB_FAIL(partition_reader.init(partition_directory_, task_id, table_schema_->get_column_count()))) {
       LOG_WARN("fail to init the partition reader.", K(ret), K(thread_id), K(task_id));
     } else if (OB_FAIL(load_sort.init(table_schema_))) {
       LOG_WARN("fail to init the sort.", K(ret), K(thread_id), K(task_id));
@@ -1019,13 +1018,17 @@ void ObSStableWriterThreadPool::run1()
           }
         } else if (OB_FAIL(load_sort.append_row(datum_row))) {
           LOG_WARN("fail to append row to the sort.", K(ret), K(thread_id), K(task_id));
+        } else {
+          all_size++;
         }
       }
+      LOG_INFO("TASK step 1",K(thread_id), K(task_id) ,K(all_size), K(ret));
       if (OB_SUCC(ret)) {
         if (OB_FAIL(load_sort.close())) {
           LOG_WARN("fail to close the sort.", K(ret), K(thread_id), K(task_id));
         }
       }
+      LOG_INFO("TASK step 2",K(thread_id), K(task_id) ,K(all_size), K(ret));
       while (OB_SUCC(ret)) {
         if (OB_FAIL(load_sort.get_next_row(datum_row))) {
           if (ret == OB_ITER_END) {
@@ -1038,13 +1041,17 @@ void ObSStableWriterThreadPool::run1()
           }
         } else if (OB_FAIL(sstable_writer_.append_row(thread_id, *datum_row))) {
           LOG_WARN("fail to append to the sstable", K(ret), K(thread_id), K(task_id));
+        } else {
+          datum_row->~ObLoadDatumRow();
         }
       }
+      LOG_INFO("TASK step 3",K(thread_id), K(task_id) ,K(all_size), K(ret));
       if (OB_SUCC(ret)) {
         if (OB_FAIL(sstable_writer_.close_macro_block_writer(thread_id))) {
           LOG_WARN("fail to close the macro_block.", K(ret), K(thread_id), K(task_id));
         }
       }
+      LOG_INFO("TASK step 4",K(thread_id), K(task_id) ,K(all_size), K(ret));
     }
     if (OB_FAIL(ret)) {
       ret_.store(ret);
@@ -1109,7 +1116,7 @@ int ObLoadDataDirect::do_load()
 {
   LOG_INFO("start load");
   int ret = OB_SUCCESS;
-  sstable_writer_thread_pool_.set_thread_count(1);
+  sstable_writer_thread_pool_.set_thread_count(4);
   sstable_writer_thread_pool_.set_run_wrapper(MTL_CTX());
   sstable_writer_thread_pool_.start();
   sstable_writer_thread_pool_.wait();
@@ -1119,7 +1126,7 @@ int ObLoadDataDirect::do_load()
     }
   }
 
-  LOG_INFO("load done");
+  LOG_INFO("load done", KR(ret));
   return ret;
 }
 

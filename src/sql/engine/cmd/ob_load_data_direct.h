@@ -236,7 +236,8 @@ public:
   int init(const std::string& partition_directory) {
     int ret = OB_SUCCESS;
     for (int64_t i=0; i<PARTITION_NUM; i++) {
-      common::ObString file_path{ (partition_directory + "/" + std::to_string(i)).c_str() };
+      std::string tmp = partition_directory + "/" + std::to_string(i);
+      common::ObString file_path{ tmp.c_str() };
       if (OB_FAIL(appenders_[i].create(file_path))) {
         LOG_WARN("fail to create partitoin file", KR(ret), K(file_path));
         break;
@@ -276,14 +277,15 @@ private:
 class ObPartitionReader
 {
 public:
-  ObPartitionReader() {}
+  ObPartitionReader() : allocator_(ObModIds::OB_SQL_LOAD_DATA) {}
 
   // read partitions includes [range_min, range_max]
-  int init(std::string partition_directory, int64_t partition_id) {
+  int init(std::string partition_directory, int64_t partition_id, int64_t capacity) {
     partition_directory_ = partition_directory;
     partition_id_ = partition_id;
-
+    capacity_ = capacity;
     int ret = OB_SUCCESS;
+    allocator_.set_tenant_id(MTL_ID());
     if (OB_FAIL(buffer_.create(DATA_BUFFER_SIZE))) {
       LOG_WARN("fail to create buffer during partition reader init", KR(ret));
     } else if (OB_FAIL(open_partition())) {
@@ -300,38 +302,21 @@ public:
     int64_t pos = 0;
     auto begin = buffer_.begin();
     auto end = buffer_.end();
-
-    datum_row = new ObLoadDatumRow();
-    if (OB_SUCC(datum_row->deserialize(begin, end - begin, pos))) {
-      buffer_.consume(pos);
-      return ret;
-    }
-
-    ret = read_next_buffer();
-    if (ret == OB_END_OF_PARTITION) {
-      delete datum_row;
-      datum_row = nullptr;
-      LOG_INFO("current partition file has been read", KR(ret));
+    if (begin >= end) {
       return OB_END_OF_PARTITION;
     }
-
-    if (ret != OB_SUCCESS) {
-      delete datum_row;
-      datum_row = nullptr;
-
+    char *buff;
+    if (OB_ISNULL(buff = static_cast<char *>(allocator_.alloc(sizeof(ObLoadDatumRow))))) {
+      ret = common::OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("fail to alloc memery.", K(ret));
+    } else if (OB_ISNULL(datum_row = new (buff) ObLoadDatumRow())) {
+      ret = common::OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("fail replace datumn_row.", K(ret));
+    } else if (OB_FAIL(datum_row->deserialize(begin, end - begin, pos))) {
       LOG_WARN("fail to read next buffer with unexpected error", KR(ret));
-      return ret;
-    }
-
-    pos = 0;
-    begin = buffer_.begin();
-    end = buffer_.end();
-    if (OB_SUCC(datum_row->deserialize(begin, end - begin, pos))) {
+    } else {
       buffer_.consume(pos);
-      return ret;
     }
-    LOG_WARN("fail to deserialize after read buffer successfully",
-             KR(ret), K(buffer_.get_data_size()), K(buffer_.get_remain_size()), K(partition_id_));
     return ret;
   }
 
@@ -371,8 +356,10 @@ private:
   }
 
 private:
+  common::ObArenaAllocator allocator_;
   std::string partition_directory_;
   int64_t partition_id_;
+  int64_t capacity_;
   ObLoadSequentialFileReader file_reader_;
   ObLoadDataBuffer buffer_;
 };
@@ -493,7 +480,7 @@ private:
 class ObLoadSort
 {
 public:
-  ObLoadSort() {}
+  ObLoadSort() : allocator_(ObModIds::OB_SQL_LOAD_DATA) {}
 
   int init(const share::schema::ObTableSchema *table_schema) {
     int ret = OB_SUCCESS;

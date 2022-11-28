@@ -69,7 +69,7 @@ struct ObPosition
 struct ObMacroDataSeq
 {
   static const int64_t BIT_DATA_SEQ = 32;
-  static const int64_t BIT_PARALLEL_IDX = 11;
+  static const int64_t BIT_PARALLEL_IDX = 63;
   static const int64_t BIT_BLOCK_TYPE = 3;
   static const int64_t BIT_MERGE_TYPE = 2;
   static const int64_t BIT_RESERVED = 15;
