@@ -268,7 +268,7 @@ int ObLoadCSVPaser::get_next_row(ObLoadFileDataBuffer &buffer, const ObNewRow *&
  */
 
 ObLoadDatumRow::ObLoadDatumRow()
-  : allocator_(ObModIds::OB_SQL_LOAD_DATA), capacity_(0), count_(0), datums_(nullptr)
+  : capacity_(0), count_(0), datums_(nullptr)
 {
 }
 
@@ -278,7 +278,7 @@ ObLoadDatumRow::~ObLoadDatumRow()
 
 void ObLoadDatumRow::reset()
 {
-  allocator_.reset();
+  // allocator_.reset();
   capacity_ = 0;
   count_ = 0;
   datums_ = nullptr;
@@ -292,9 +292,10 @@ int ObLoadDatumRow::init(int64_t capacity)
     LOG_WARN("invalid args", KR(ret), K(capacity));
   } else {
     reset();
-    allocator_.set_tenant_id(MTL_ID());
+    // allocator_.set_tenant_id(MTL_ID());
+    auto &allocator = ObLoadDatumRowAllocator::get_allocator();
     if (OB_ISNULL(datums_ = static_cast<ObStorageDatum *>(
-                    allocator_.alloc(sizeof(ObStorageDatum) * capacity)))) {
+                    allocator.alloc(sizeof(ObStorageDatum) * capacity)))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("fail to alloc memory", KR(ret));
     } else {
@@ -895,6 +896,8 @@ void ObLoadDataSplitThreadPool::run1()
   const ObLoadArgument &load_args = load_stmt_->get_load_arguments();
   const auto &field_or_var_list = load_stmt_->get_field_or_var_list();
   const int64_t thread_id = (const int64_t)(this->get_thread_idx());
+  auto &datum_row_allocator = ObLoadDatumRowAllocator::get_allocator();
+  datum_row_allocator.set_tenant_id(MTL_ID());
   LOG_INFO("data split start" , K(thread_id), K(MTL_ID()));
 
   int ret = OB_SUCCESS;
@@ -984,12 +987,15 @@ void ObLoadDataSplitThreadPool::run1()
         break;
       }
     }
+
+    datum_row_allocator.reset();
     if (OB_FAIL(ret)) {
       ret_.store(ret);
       LOG_WARN("loop err", KR(ret));
     }
   }
 
+  datum_row_allocator.reset();
   if (OB_FAIL(ret)) {
     ret_.store(ret);
   }
@@ -1004,6 +1010,9 @@ void ObSStableWriterThreadPool::run1()
   Worker::set_compatibility_mode(mode);
   // TODO
   const int64_t thread_id = (const int64_t)(this->get_thread_idx());
+  auto &datum_row_allocator = ObLoadDatumRowAllocator::get_allocator();
+  datum_row_allocator.set_tenant_id(MTL_ID());
+
   int ret = OB_SUCCESS;
   int64_t all_size = 0;
   while (OB_SUCC(ret_.load())) {
@@ -1062,6 +1071,8 @@ void ObSStableWriterThreadPool::run1()
           datum_row->~ObLoadDatumRow();
         }
       }
+
+      datum_row_allocator.reset();
       LOG_INFO("TASK step 3",K(thread_id), K(task_id) ,K(all_size), K(ret));
       if (OB_SUCC(ret)) {
         if (OB_FAIL(sstable_writer_.close_macro_block_writer(thread_id))) {
@@ -1074,6 +1085,7 @@ void ObSStableWriterThreadPool::run1()
       ret_.store(ret);
     }
   }
+  datum_row_allocator.reset();
 }
 
 /**
