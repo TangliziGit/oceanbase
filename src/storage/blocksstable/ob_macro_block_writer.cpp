@@ -425,6 +425,7 @@ int ObMacroBlockWriter::append_row(const ObDatumRow &row, const int64_t split_si
         } else if (OB_FAIL(save_last_key(*row_to_append))) {
           STORAGE_LOG(WARN, "Fail to save last key, ", K(ret), K(row));
         }
+        LOG_INFO("last key d1.", K(row));
         if (OB_SUCC(ret) && data_store_desc_->need_prebuild_bloomfilter_) {
           ObDatumRowkey rowkey;
           uint64_t hash = 0;
@@ -463,6 +464,7 @@ int ObMacroBlockWriter::append_row(const ObDatumRow &row, const int64_t split_si
           STORAGE_LOG(WARN, "Fail to build micro block, ", K(ret));
         }
       }
+      LOG_INFO("last key d2.", K(row));
     }
   }
   return ret;
@@ -501,7 +503,7 @@ int ObMacroBlockWriter::append_macro_block(const ObMacroBlockDesc &macro_desc)
     } else if (OB_FAIL(save_last_key(rowkey))) {
       LOG_WARN("Fail to copy last key", K(ret), K(rowkey));
     }
-
+    LOG_INFO("save last key debug.", K(rowkey));
     if (OB_SUCC(ret)) {
       is_macro_or_micro_block_reused_ = true;
       last_key_with_L_flag_ = false; // clear flag
@@ -835,7 +837,7 @@ int ObMacroBlockWriter::build_micro_block_desc_with_reuse(
     micro_block_desc.has_out_row_column_ = micro_block.micro_index_info_->has_out_row_column();
     micro_block_desc.original_size_ = header.original_length_;
   }
-  STORAGE_LOG(DEBUG, "build micro block desc reuse", K(data_store_desc_->tablet_id_), K(micro_block_desc), "lbt", lbt(), K(ret));
+  STORAGE_LOG(DEBUG, "build micro block desc reuse", K(data_store_desc_->tablet_id_), K(micro_block_desc), "lbt", lbt(), K(ret), K(last_key_));
   return ret;
 }
 
@@ -901,7 +903,7 @@ int ObMacroBlockWriter::build_micro_block_desc_with_rewrite(
       }
     }
   }
-  STORAGE_LOG(DEBUG, "build micro block desc rewrite", K(data_store_desc_->tablet_id_), K(micro_block_desc), "lbt", lbt(), K(ret));
+  STORAGE_LOG(DEBUG, "build micro block desc rewrite", K(data_store_desc_->tablet_id_), K(micro_block_desc), "lbt", lbt(), K(ret), K(last_key_));
   return ret;
 }
 

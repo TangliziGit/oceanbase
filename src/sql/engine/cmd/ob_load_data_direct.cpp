@@ -717,7 +717,7 @@ int ObLoadSSTableWriter::reuse_macro_block_writer(const int index,const int64_t 
   macro_block_writers_[index].reset();
   if (OB_SUCC(ret)) {
     ObMacroDataSeq data_seq;
-    data_seq.set_parallel_degree(task_id * 1000);
+    data_seq.set_parallel_degree(task_id * 100000000);
     if (OB_FAIL(macro_block_writers_[index].open(data_store_desc_, data_seq))) {
       LOG_WARN("fail to init macro block writer", KR(ret), K(data_store_desc_), K(data_seq));
     }
@@ -737,6 +737,7 @@ int ObLoadSSTableWriter::close_macro_block_writer(const int index)
 int ObLoadSSTableWriter::append_row(const int index, const ObLoadDatumRow &datum_row)
 {
   int ret = OB_SUCCESS;
+  blocksstable::ObDatumRow new_datum_row;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("ObLoadSSTableWriter not init", KR(ret), KP(this));
@@ -746,21 +747,28 @@ int ObLoadSSTableWriter::append_row(const int index, const ObLoadDatumRow &datum
   } else if (OB_UNLIKELY(!datum_row.is_valid() || datum_row.count_ != column_count_)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid args", KR(ret), K(datum_row), K(column_count_));
+  } else if (new_datum_row.init(column_count_ + extra_rowkey_column_num_)){
+    LOG_WARN("fail to init new datum row.", KR(ret));
   } else {
+    new_datum_row.row_flag_.set_flag(ObDmlFlag::DF_INSERT);
+    new_datum_row.mvcc_row_flag_.set_last_multi_version_row(true);
+    new_datum_row.storage_datums_[rowkey_column_num_].set_int(-1); // fill trans_version
+    new_datum_row.storage_datums_[rowkey_column_num_ + 1].set_int(0); // fill sql_no
     for (int64_t i = 0; i < column_count_; ++i) {
       if (i < rowkey_column_num_) {
-        datum_row_.storage_datums_[i] = datum_row.datums_[i];
+        new_datum_row.storage_datums_[i] = datum_row.datums_[i];
       } else {
-        datum_row_.storage_datums_[i + extra_rowkey_column_num_] = datum_row.datums_[i];
+        new_datum_row.storage_datums_[i + extra_rowkey_column_num_] = datum_row.datums_[i];
+        LOG_WARN("Unexpected line.");
       }
     }
-    // int64_t pk1 = datum_row.datums_[0].get_int();
-    // int64_t pk2 = datum_row.datums_[1].get_int();
-    // LOG_INFO("append element: ", K(pk1), K(pk2), K((long)(&datum_row)));
-    if (OB_FAIL(macro_block_writers_[index].append_row(datum_row_))) {
+    int64_t pk1 = datum_row.datums_[0].get_int();
+    int64_t pk2 = datum_row.datums_[1].get_int();
+    // LOG_INFO("append element: ", K(pk1), K(pk2), K(index));
+    if (OB_FAIL(macro_block_writers_[index].append_row(new_datum_row))) {
       int64_t pk1 = datum_row.datums_[0].get_int();
       int64_t pk2 = datum_row.datums_[1].get_int();
-      LOG_WARN("fail to append row", KR(ret), K(pk1), K(pk2));
+      LOG_WARN("fail to append row", KR(ret), K(pk1), K(pk2), K(index));
     }
   }
   return ret;
@@ -837,6 +845,9 @@ int ObLoadSSTableWriter::create_sstable()
 int ObLoadSSTableWriter::close()
 {
   int ret = OB_SUCCESS;
+  for (int i = 0; i < N_CPU; i++) {
+    macro_block_writers_[i].reset();
+  }
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("ObLoadSSTableWriter not init", KR(ret), KP(this));
@@ -850,6 +861,9 @@ int ObLoadSSTableWriter::close()
     } else {
       is_closed_ = true;
     }
+  }
+  for (int i = 0; i < N_CPU; i++) {
+    macro_block_writers_[i].reset();
   }
   return ret;
 }
@@ -995,6 +1009,9 @@ void ObSStableWriterThreadPool::run1()
   while (OB_SUCC(ret_.load())) {
     int32_t task_id = get_task();
     if (task_id > max_id_) {
+      if (OB_FAIL(sstable_writer_.reuse_macro_block_writer(thread_id, task_id, table_schema_))) {
+        LOG_WARN("fail to reuse the sstable writer.", K(ret), K(thread_id), K(task_id));
+      }
       break;
     }
     LOG_INFO("load task start.", K(ret), K(thread_id), K(task_id));
@@ -1116,7 +1133,7 @@ int ObLoadDataDirect::do_load()
 {
   LOG_INFO("start load");
   int ret = OB_SUCCESS;
-  sstable_writer_thread_pool_.set_thread_count(4);
+  sstable_writer_thread_pool_.set_thread_count(N_CPU);
   sstable_writer_thread_pool_.set_run_wrapper(MTL_CTX());
   sstable_writer_thread_pool_.start();
   sstable_writer_thread_pool_.wait();
