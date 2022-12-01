@@ -20,7 +20,7 @@
 
 static constexpr int64_t FILE_DATA_BUFFER_SIZE = (2LL << 20); // 2M
 static constexpr int64_t DATA_BUFFER_SIZE = (200LL << 20); // 200M
-static constexpr int64_t PARTITION_NUM = 650;
+static constexpr int64_t PARTITION_NUM = 400;
 static constexpr int64_t PK_MIN = 1;
 static constexpr int64_t PK_MAX = 300000000;
 static constexpr int64_t PK_SPAN = (PK_MAX - PK_MIN + 1) / PARTITION_NUM;
@@ -29,7 +29,7 @@ static const char * PARTITION_DIR = "./load-partition/";
 static constexpr int64_t TASK_SIZE = (1LL << 28); // 256M
 static constexpr int64_t MEM_BUFFER_SIZE = (1LL << 30); // 1G
 static constexpr int64_t SORT_BUFFER_SIZE = 4 * (1LL << 30); // 4G
-static constexpr int64_t N_CPU = 16;
+static constexpr int64_t N_CPU = 8;
 static constexpr int64_t N_LOCK_SHARD = PARTITION_NUM;
 
 // additional error code `OB_END_OF_PARTITION`,
