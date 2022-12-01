@@ -654,19 +654,23 @@ int ObLoadSSTableWriter::init(const ObTableSchema *table_schema)
       LOG_WARN("fail to get tablet handle", KR(ret), K(tablet_id_));
     } else if (OB_FAIL(init_sstable_index_builder(table_schema))) {
       LOG_WARN("fail to init sstable index builder", KR(ret));
-    } else if (OB_FAIL(datum_row_.init(column_count_ + extra_rowkey_column_num_))) {
-      LOG_WARN("fail to init datum row", KR(ret));
     } else if (OB_FAIL(data_store_desc_.init(*table_schema, ls_id_, tablet_id_, MAJOR_MERGE, 1))) {
       LOG_WARN("fail to init data_store_desc", KR(ret), K(tablet_id_));
     } else {
+      for (int i = 0; i < N_CPU; i++) {
+        if (OB_FAIL(datum_rows_[i].init(column_count_ + extra_rowkey_column_num_))) {
+          LOG_WARN("fail to init datum row", KR(ret));
+          break;
+        }
+        datum_rows_[i].row_flag_.set_flag(ObDmlFlag::DF_INSERT);
+        datum_rows_[i].mvcc_row_flag_.set_last_multi_version_row(true);
+        datum_rows_[i].storage_datums_[rowkey_column_num_].set_int(-1); // fill trans_version
+        datum_rows_[i].storage_datums_[rowkey_column_num_ + 1].set_int(0); // fill sql_no
+      }
       table_key_.table_type_ = ObITable::MAJOR_SSTABLE;
       table_key_.tablet_id_ = tablet_id_;
       table_key_.log_ts_range_.start_log_ts_ = 0;
       table_key_.log_ts_range_.end_log_ts_ = ObTimeUtil::current_time_ns();
-      datum_row_.row_flag_.set_flag(ObDmlFlag::DF_INSERT);
-      datum_row_.mvcc_row_flag_.set_last_multi_version_row(true);
-      datum_row_.storage_datums_[rowkey_column_num_].set_int(-1); // fill trans_version
-      datum_row_.storage_datums_[rowkey_column_num_ + 1].set_int(0); // fill sql_no
       data_store_desc_.sstable_index_builder_ = &sstable_index_builder_;
       is_inited_ = true;
     }
@@ -738,7 +742,6 @@ int ObLoadSSTableWriter::close_macro_block_writer(const int index)
 int ObLoadSSTableWriter::append_row(const int index, const ObLoadDatumRow &datum_row)
 {
   int ret = OB_SUCCESS;
-  blocksstable::ObDatumRow new_datum_row;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("ObLoadSSTableWriter not init", KR(ret), KP(this));
@@ -748,25 +751,18 @@ int ObLoadSSTableWriter::append_row(const int index, const ObLoadDatumRow &datum
   } else if (OB_UNLIKELY(!datum_row.is_valid() || datum_row.count_ != column_count_)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid args", KR(ret), K(datum_row), K(column_count_));
-  } else if (new_datum_row.init(column_count_ + extra_rowkey_column_num_)){
-    LOG_WARN("fail to init new datum row.", KR(ret));
   } else {
-    new_datum_row.row_flag_.set_flag(ObDmlFlag::DF_INSERT);
-    new_datum_row.mvcc_row_flag_.set_last_multi_version_row(true);
-    new_datum_row.storage_datums_[rowkey_column_num_].set_int(-1); // fill trans_version
-    new_datum_row.storage_datums_[rowkey_column_num_ + 1].set_int(0); // fill sql_no
     for (int64_t i = 0; i < column_count_; ++i) {
       if (i < rowkey_column_num_) {
-        new_datum_row.storage_datums_[i] = datum_row.datums_[i];
+        datum_rows_[index].storage_datums_[i] = datum_row.datums_[i];
       } else {
-        new_datum_row.storage_datums_[i + extra_rowkey_column_num_] = datum_row.datums_[i];
-        LOG_WARN("Unexpected line.");
+        datum_rows_[index].storage_datums_[i + extra_rowkey_column_num_] = datum_row.datums_[i];
       }
     }
-    int64_t pk1 = datum_row.datums_[0].get_int();
-    int64_t pk2 = datum_row.datums_[1].get_int();
+    // int64_t pk1 = datum_row.datums_[0].get_int();
+    // int64_t pk2 = datum_row.datums_[1].get_int();
     // LOG_INFO("append element: ", K(pk1), K(pk2), K(index));
-    if (OB_FAIL(macro_block_writers_[index].append_row(new_datum_row))) {
+    if (OB_FAIL(macro_block_writers_[index].append_row(datum_rows_[index]))) {
       int64_t pk1 = datum_row.datums_[0].get_int();
       int64_t pk2 = datum_row.datums_[1].get_int();
       LOG_WARN("fail to append row", KR(ret), K(pk1), K(pk2), K(index));
