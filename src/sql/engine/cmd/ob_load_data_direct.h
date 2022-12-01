@@ -85,9 +85,9 @@ public:
     file_begin_pos_ += size;
   }
 private:
-  int64_t file_begin_pos_;
-  int64_t file_end_pos_;
-  bool step_;
+  int64_t file_begin_pos_ = 0;
+  int64_t file_end_pos_ = 0;
+  bool step_ = false;
 };
 
 class ObLoadSequentialFileReader
