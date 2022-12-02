@@ -239,7 +239,7 @@ int ObLoadCSVPaser::get_next_row(ObLoadFileDataBuffer &buffer, const ObNewRow *&
       LOG_WARN("fail to parse line", KR(ret));
     } else if (0 == nrows) {
       ret = OB_ITER_END;
-      LOG_WARN("end of file", KR(ret));
+      // LOG_WARN("end of file", KR(ret));
     } else if (buffer.is_compete()) {
       ret = OB_TASK_FINISH;
       LOG_INFO("TASK FINISH .", K(buffer.get_file_pos()));    
@@ -486,6 +486,8 @@ int ObLoadRowCaster::init(const ObTableSchema *table_schema,
   } else if (OB_FAIL(datum_row_.init(table_schema->get_column_count()))) {
     LOG_WARN("fail to init datum row", KR(ret));
   } else {
+    ObDataTypeCastParams cast_params(&tz_info_);
+    cast_params_ = cast_params;
     column_count_ = table_schema->get_column_count();
     collation_type_ = table_schema->get_collation_type();
     cast_allocator_.set_tenant_id(MTL_ID());
@@ -574,8 +576,8 @@ int ObLoadRowCaster::cast_obj_to_datum(const ObColumnSchemaV2 *column_schema, co
                                        ObStorageDatum &datum)
 {
   int ret = OB_SUCCESS;
-  ObDataTypeCastParams cast_params(&tz_info_);
-  ObCastCtx cast_ctx(&cast_allocator_, &cast_params, CM_NONE, collation_type_);
+  // ObDataTypeCastParams cast_params(&tz_info_);
+  ObCastCtx cast_ctx(&cast_allocator_, &cast_params_, CM_NONE, collation_type_);
   const ObObjType expect_type = column_schema->get_meta_type().get_type();
   ObObj casted_obj;
   if (obj.is_null()) {
@@ -759,6 +761,10 @@ int ObLoadSSTableWriter::append_row(const int index, const ObLoadDatumRow &datum
         datum_rows_[index].storage_datums_[i + extra_rowkey_column_num_] = datum_row.datums_[i];
       }
     }
+    /*MEMCPY(datum_rows_[index].storage_datums_, datum_row.datums_, sizeof(ObStorageDatum) * rowkey_column_num_);
+    MEMCPY(datum_rows_[index].storage_datums_ + sizeof(ObStorageDatum) * (rowkey_column_num_ + extra_rowkey_column_num_), 
+            datum_row.datums_ + sizeof(ObStorageDatum) * rowkey_column_num_, 
+            sizeof(ObStorageDatum) * (column_count_ - rowkey_column_num_));*/
     // int64_t pk1 = datum_row.datums_[0].get_int();
     // int64_t pk2 = datum_row.datums_[1].get_int();
     // LOG_INFO("append element: ", K(pk1), K(pk2), K(index));
@@ -946,9 +952,9 @@ void ObLoadDataSplitThreadPool::run1()
           while (OB_SUCC(ret)) {
             if (OB_FAIL(csv_parser.get_next_row(buffer, new_row))) {
               if (OB_UNLIKELY(OB_ITER_END == ret)) {
-                LOG_WARN("fail to get next row", KR(ret));
+                //LOG_WARN("fail to get next row", KR(ret));
               } else if (OB_UNLIKELY(OB_TASK_FINISH == ret)) {
-                LOG_INFO("TASK : HAS BEEN FINISHED !!!", K(task_id));
+                //LOG_INFO("TASK : HAS BEEN FINISHED !!!", K(task_id));
               } else if (OB_UNLIKELY(OB_NEED_RETRY == ret)) {
                 ret = OB_SUCCESS;
                 continue;
@@ -967,11 +973,11 @@ void ObLoadDataSplitThreadPool::run1()
           block_id++;
         }
 
-        LOG_INFO("TASK block",K(thread_id), K(task_id), K(task_num), K(block_id), K(ret));
+        //LOG_INFO("TASK block",K(thread_id), K(task_id), K(task_num), K(block_id), K(ret));
       }
 
       all_size += task_num;
-      LOG_INFO("TASK tt block",K(thread_id), K(task_id), K(task_num), K(block_id), K(ret));
+      // LOG_INFO("TASK tt block",K(thread_id), K(task_id), K(task_num), K(block_id), K(ret));
       
       if (OB_UNLIKELY(ret == OB_ITER_END)) {
         ret = OB_SUCCESS;
