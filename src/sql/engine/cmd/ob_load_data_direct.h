@@ -20,10 +20,14 @@
 
 static constexpr int64_t FILE_DATA_BUFFER_SIZE = (2LL << 20); // 2M
 static constexpr int64_t DATA_BUFFER_SIZE = (200LL << 20); // 200M
-static constexpr int64_t PARTITION_NUM = 400;
-static constexpr int64_t PK_MIN = 1;
+static constexpr int64_t PK_MIN = 0;
 static constexpr int64_t PK_MAX = 300000000;
-static constexpr int64_t PK_SPAN = (PK_MAX - PK_MIN + 1) / PARTITION_NUM;
+static constexpr int64_t PK_SPAN = (1LL << 16); 
+static constexpr int64_t PK1_BITE = 16; 
+static constexpr int64_t PK2_BITE = 4; 
+static constexpr int64_t U_INT = 10; 
+static constexpr int64_t MASK = (1LL << U_INT) - 1; 
+static constexpr int64_t PARTITION_NUM = PK_MAX / PK_SPAN + 1 - PK_MIN / PK_SPAN;
 static const char * PARTITION_DIR = "./load-partition/";
 
 static constexpr int64_t TASK_SIZE = (128LL << 20); // 128M
@@ -153,6 +157,7 @@ public:
   int64_t get_deep_copy_size() const;
   int deep_copy(const ObLoadDatumRow &src, char *buf, int64_t len, int64_t &pos);
   OB_INLINE bool is_valid() const { return count_ > 0 && nullptr != datums_; }
+  OB_INLINE int64_t get_bits(int index) { return (((datums_[0].get_int() << PK2_BITE) + datums_[1].get_int()) >> index) & MASK; }
   DECLARE_TO_STRING;
 public:
   // common::ObArenaAllocator allocator_;
@@ -262,6 +267,10 @@ public:
   int append_row(const ObLoadDatumRow *&datum_row) {
     // TODO: select pk via StorageDatumUtils
     int64_t key = gen_key(datum_row->datums_[0].get_int());
+    if (datum_row->datums_[1].get_int() > 16) {
+      LOG_WARN("TEST FAIL OB_ERR_UNEXPECTED.", K(datum_row->datums_[1].get_int()));
+      return OB_ERR_UNEXPECTED;
+    }
 
     char buf[1024];
     int64_t pos = 0;
@@ -533,13 +542,37 @@ public:
       LOG_WARN("received null datum row");
       return OB_ERR_UNEXPECTED;
     }
-
     datum_rows_.push_back(datum_row);
     return OB_SUCCESS;
   }
 
   int close() {
-    std::sort(datum_rows_.begin(), datum_rows_.end(), compare_);
+    // std::sort(datum_rows_.begin(), datum_rows_.end(), compare_);
+    int n = datum_rows_.size();
+    copy_datum_rows_.resize(n, nullptr);
+    for (int i = 0; i < PK1_BITE + PK2_BITE; i += U_INT) {
+      memset(cnt, 0, sizeof(cnt));
+      for (int j = 0; j != n; ++j)
+        cnt[datum_rows_[j]->get_bits(i)]++;
+      if (cnt[0] == n) continue;
+      for (int sum = 0, j = 0; j != (1 << U_INT); ++j) {
+        sum += cnt[j];
+        cnt[j] = sum - cnt[j];
+      }
+      for (int j = 0; j != n; ++j) {
+        int index =cnt[datum_rows_[j]->get_bits(i)];
+        if (cnt[datum_rows_[j]->get_bits(i)] >= n) {
+          LOG_WARN("TEST FAIL IN SORT 1.", K(index));
+        }
+        index = datum_rows_[j]->get_bits(i);
+        if (datum_rows_[j]->get_bits(i) > MASK) {
+          LOG_WARN("TEST FAIL IN SORT 2.", K(index));
+        } 
+        copy_datum_rows_[cnt[datum_rows_[j]->get_bits(i)]++] = datum_rows_[j];
+      }
+        
+      std::swap(datum_rows_, copy_datum_rows_);
+    }
     LOG_INFO("sorted item size", K(datum_rows_.size()));
     return OB_SUCCESS;
   }
@@ -555,6 +588,8 @@ private:
   common::ObArenaAllocator allocator_;
   blocksstable::ObStorageDatumUtils datum_utils_;
   ObLoadDatumRowCompare compare_;
+  int64_t cnt[1 << U_INT];
+  std::vector<ObLoadDatumRow *> copy_datum_rows_;
   std::vector<ObLoadDatumRow *> datum_rows_;
   int pos_ = 0;
   bool is_inited_ = false;
