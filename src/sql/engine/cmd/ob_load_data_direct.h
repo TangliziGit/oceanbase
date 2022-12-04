@@ -150,7 +150,6 @@ class ObLoadDatumRow
   OB_UNIS_VERSION(1);
 public:
   ObLoadDatumRow();
-  ObLoadDatumRow(int64_t rowkey_column_num, int64_t extra_column_num);
   ~ObLoadDatumRow();
   void reset();
   int init(int64_t capacity);
@@ -163,8 +162,6 @@ public:
   // common::ObArenaAllocator allocator_;
   int64_t capacity_;
   int64_t count_;
-  int64_t rowkey_column_num_;
-  int64_t extra_column_num_;
   blocksstable::ObStorageDatum *datums_;
 };
 
@@ -331,7 +328,7 @@ public:
     if (OB_ISNULL(buff = static_cast<char *>(allocator_.alloc(sizeof(ObLoadDatumRow))))) {
       ret = common::OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("fail to alloc memery.", K(ret));
-    } else if (OB_ISNULL(datum_row = new (buff) ObLoadDatumRow(2,2))) {
+    } else if (OB_ISNULL(datum_row = new (buff) ObLoadDatumRow())) {
       ret = common::OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("fail replace datumn_row.", K(ret));
     } else if (OB_FAIL(datum_row->deserialize(begin, end - begin, pos))) {

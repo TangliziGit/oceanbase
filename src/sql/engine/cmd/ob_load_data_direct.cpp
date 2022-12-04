@@ -268,11 +268,7 @@ int ObLoadCSVPaser::get_next_row(ObLoadFileDataBuffer &buffer, const ObNewRow *&
  */
 
 ObLoadDatumRow::ObLoadDatumRow()
-  : capacity_(0), count_(0), rowkey_column_num_(0),extra_column_num_(0),datums_(nullptr)
-{
-}
-ObLoadDatumRow::ObLoadDatumRow(int64_t rowkey_column_num, int64_t extra_column_num)
-  : capacity_(0), count_(0), rowkey_column_num_(rowkey_column_num),extra_column_num_(extra_column_num),datums_(nullptr)
+  : capacity_(0), count_(0), datums_(nullptr)
 {
 }
 
@@ -381,19 +377,11 @@ OB_DEF_DESERIALIZE(ObLoadDatumRow)
     if (OB_UNLIKELY(count <= 0)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected count", K(count));
-    } else if (count > capacity_ && OB_FAIL(init(count + extra_column_num_))) {
+    } else if (count > capacity_ && OB_FAIL(init(count))) {
       LOG_WARN("fail to init", KR(ret));
     } else {
-      for (int64_t i = 0; OB_SUCC(ret) && i < (count); ++i) {       
-        if (i < rowkey_column_num_) {
-          OB_UNIS_DECODE(datums_[i]);
-        } else {
-          OB_UNIS_DECODE(datums_[i + extra_column_num_]);
-        }                             
-      }
-      datums_[rowkey_column_num_].set_int(-1); // fill trans_version
-      datums_[rowkey_column_num_ + 1].set_int(0); // fill sql_no
-      count_ = count + extra_column_num_;
+      OB_UNIS_DECODE_ARRAY(datums_, count);
+      count_ = count;
     }
   }
   return ret;
@@ -762,18 +750,17 @@ int ObLoadSSTableWriter::append_row(const int index, const ObLoadDatumRow &datum
   } else if (OB_UNLIKELY(is_closed_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected closed external sort", KR(ret));
-  } else if (OB_UNLIKELY(!datum_row.is_valid() || datum_row.count_ != column_count_ + extra_rowkey_column_num_)) {
+  } else if (OB_UNLIKELY(!datum_row.is_valid() || datum_row.count_ != column_count_)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid args", KR(ret), K(datum_row), K(column_count_));
   } else {
-    /*for (int64_t i = 0; i < column_count_; ++i) {
+    for (int64_t i = 0; i < column_count_; ++i) {
       if (i < rowkey_column_num_) {
         datum_rows_[index].storage_datums_[i] = datum_row.datums_[i];
       } else {
         datum_rows_[index].storage_datums_[i + extra_rowkey_column_num_] = datum_row.datums_[i];
       }
-    }*/
-    datum_rows_[index].storage_datums_ = datum_row.datums_;
+    }
     /*MEMCPY(datum_rows_[index].storage_datums_, datum_row.datums_, sizeof(ObStorageDatum) * rowkey_column_num_);
     MEMCPY(datum_rows_[index].storage_datums_ + sizeof(ObStorageDatum) * (rowkey_column_num_ + extra_rowkey_column_num_), 
             datum_row.datums_ + sizeof(ObStorageDatum) * rowkey_column_num_, 
