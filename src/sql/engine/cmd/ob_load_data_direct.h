@@ -20,7 +20,7 @@
 
 static constexpr int64_t FILE_DATA_BUFFER_SIZE = (2LL << 20); // 2M
 static constexpr int64_t DATA_BUFFER_SIZE = (200LL << 20); // 200M
-static constexpr int64_t PARTITION_NUM = 800;
+static constexpr int64_t PARTITION_NUM = 400;
 static constexpr int64_t PK_MIN = 1;
 static constexpr int64_t PK_MAX = 300000000;
 static constexpr int64_t PK_SPAN = (PK_MAX - PK_MIN + 1) / PARTITION_NUM;
