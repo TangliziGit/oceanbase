@@ -774,13 +774,6 @@ int ObLoadSSTableWriter::append_row(const int index, const ObLoadDatumRow &datum
       }
     }*/
     datum_rows_[index].storage_datums_ = datum_row.datums_;
-    /*MEMCPY(datum_rows_[index].storage_datums_, datum_row.datums_, sizeof(ObStorageDatum) * rowkey_column_num_);
-    MEMCPY(datum_rows_[index].storage_datums_ + sizeof(ObStorageDatum) * (rowkey_column_num_ + extra_rowkey_column_num_), 
-            datum_row.datums_ + sizeof(ObStorageDatum) * rowkey_column_num_, 
-            sizeof(ObStorageDatum) * (column_count_ - rowkey_column_num_));*/
-    // int64_t pk1 = datum_row.datums_[0].get_int();
-    // int64_t pk2 = datum_row.datums_[1].get_int();
-    // LOG_INFO("append element: ", K(pk1), K(pk2), K(index));
     if (OB_FAIL(macro_block_writers_[index].append_row(datum_rows_[index]))) {
       int64_t pk1 = datum_row.datums_[0].get_int();
       int64_t pk2 = datum_row.datums_[1].get_int();
