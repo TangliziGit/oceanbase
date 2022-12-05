@@ -544,7 +544,7 @@ public:
   }
 
   int close() {
-    // std::sort(datum_rows_.begin(), datum_rows_.end(), compare_);
+    //std::sort(datum_rows_.begin(), datum_rows_.end(), compare_);
     int n = datum_rows_.size();
     copy_datum_rows_.resize(n, nullptr);
     for (int i = 0; i < PK1_BITE + PK2_BITE; i += U_INT) {
