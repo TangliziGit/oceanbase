@@ -1031,6 +1031,9 @@ void ObSStableWriterThreadPool::run1()
       }
       break;
     }
+    if (task_id == 1144) {
+      LOG_INFO("-----");
+    }
     LOG_INFO("load task start.", K(ret), K(thread_id), K(task_id));
     ObLoadDatumRow *datum_row = nullptr;
     ObLoadSort load_sort;
@@ -1044,7 +1047,7 @@ void ObSStableWriterThreadPool::run1()
     } else {
       while (OB_SUCC(ret)) {
         if (OB_FAIL(partition_reader.read(datum_row))) {
-          if (ret != OB_END_OF_PARTITION) {
+          if (ret != OB_ITER_END) {
             LOG_WARN("fail to read the next row of partition reader.", K(ret), K(thread_id), K(task_id));
           } else {
             ret = OB_SUCCESS;
@@ -1053,6 +1056,15 @@ void ObSStableWriterThreadPool::run1()
         } else if (OB_FAIL(load_sort.append_row(datum_row))) {
           LOG_WARN("fail to append row to the sort.", K(ret), K(thread_id), K(task_id));
         } else {
+          if (task_id == 1144) {
+            int64_t row = datum_row->datums_[0].get_int();
+            if (row < 0) {
+              LOG_INFO("ffffff",K(row));
+            } else {
+              LOG_INFO("jjjjjj",K(row));
+            }
+            
+          }
           all_size++;
         }
       }

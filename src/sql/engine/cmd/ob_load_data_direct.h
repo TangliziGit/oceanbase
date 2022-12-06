@@ -31,14 +31,17 @@ static constexpr int64_t PARTITION_NUM = PK_MAX / PK_SPAN + 1 - PK_MIN / PK_SPAN
 static const char * PARTITION_DIR = "./load-partition/";
 
 static constexpr int64_t TASK_SIZE = (128LL << 20); // 128M
+static constexpr int64_t COMPRESS_BUFF_SIZE = (1LL << 20); // 1M
 static constexpr int64_t MEM_BUFFER_SIZE = (1LL << 30); // 1G
 static constexpr int64_t SORT_BUFFER_SIZE = 4 * (1LL << 30); // 4G
-static constexpr int64_t N_CPU = 4;
+static constexpr int64_t N_CPU = 8;
 static constexpr int64_t N_LOCK_SHARD = PARTITION_NUM;
 
+static constexpr ObCompressorType COMPRESS_TYPE = ZSTD_1_3_8_COMPRESSOR;
 // additional error code `OB_END_OF_PARTITION`,
 // which means this partition has been read through,
 // and next partition file is needed to be open.
+static constexpr int OB_BUFFER_FULL = -4039;
 static constexpr int OB_END_OF_PARTITION = -4745;
 static constexpr int OB_TASK_FINISH = -4011;
 
@@ -248,15 +251,87 @@ private:
 class ObPartitionWriter
 {
 public:
-  using BufferFileAppender = common::FileComponent::BufferFileAppender;
+using BufferFileAppender = common::FileComponent::BufferFileAppender;
+  typedef struct
+  {
+    int create(int64_t capacity, common::ObArenaAllocator* allocator, common::ObString file_path) {
+      int ret = OB_SUCCESS;
+      allocator_ = allocator;
+      int64_t max_overflow_size = 0;
+      if (OB_FAIL(ObCompressorPool::get_instance().get_compressor(COMPRESS_TYPE, compressor_))) {
+        STORAGE_LOG(WARN, "Fail to get compressor, ", K(ret), K(COMPRESS_TYPE));
+      } else if (compressor_->get_max_overflow_size(capacity, max_overflow_size)) {
+        LOG_WARN("fail to get max overflow size.", KR(ret));
+      } else if (OB_ISNULL(buff_ = static_cast<char*>(allocator_->alloc(capacity)))) {
+        LOG_WARN("fail to allocat in paertition reader.",KR(ret));
+      } else if (OB_ISNULL(compress_buff_ = static_cast<char*>(allocator_->alloc(capacity + max_overflow_size + sizeof(int64_t))))) {
+        LOG_WARN("fail to allocat in paertition reader.",KR(ret));
+      } else if (OB_FAIL(appender_.create(file_path))) {
+        LOG_WARN("fail to create partitoin file", KR(ret), K(file_path));
+      } else {
+        compress_capacity_ = capacity + max_overflow_size + sizeof(int64_t);
+        capacity_ = capacity;
+        offset_ = 0;
+      }
+      return ret;
+    }
+    int append_row(const ObLoadDatumRow *&datum_row) {
+      int ret = OB_SUCCESS;
+      if (OB_FAIL(datum_row->serialize(buff_ , capacity_, offset_))) {
+        LOG_WARN("datum row serialize fail.", KR(ret), K(offset_));
+      } else if (capacity_ - offset_ > tail_size_) {
+        
+      } else if (OB_FAIL(flush())) {
+        LOG_WARN("fail to flush compress block.", KR(ret));
+      } else {
+        offset_ = 0;
+      }
+      return ret;
+    }
+    int close() {
+      int ret = OB_SUCCESS;
+      if (offset_ == 0) {
+      } else if (OB_FAIL(flush())) {
+        LOG_WARN("append flash fail.", KR(ret));
+      }
+      appender_.close();
+      return ret;
+    };
+    int flush() {
+      int ret = OB_SUCCESS;
+      int64_t size = 0;
+      int64_t count_pos = 0;
+      if (OB_FAIL(compressor_->compress(buff_, offset_, compress_buff_ + sizeof(size), compress_capacity_ - sizeof(size), size))) {
+        LOG_WARN("fail to compress tmp file block.", KR(ret));
+      } else if (OB_FAIL(NS_::encode(compress_buff_, sizeof(size), count_pos, size))) {
+        LOG_WARN("fail to seriealize size of block.", KR(ret));
+      } else if (OB_FAIL(appender_.append(compress_buff_, size + sizeof(size), false))) {
+        LOG_WARN("fail to append tmp file block.", KR(ret));
+      }
+      return ret;
+    }
+    OB_INLINE bool sholud_flash() { return capacity_ - offset_ < tail_size_; }
+    common::ObArenaAllocator *allocator_;
+    char *buff_;
+    char *compress_buff_;
+    int64_t capacity_;
+    int64_t compress_capacity_;
+    int64_t offset_ = 0;
+    int64_t tail_size_ = 512;
+    BufferFileAppender appender_;
+    common::ObCompressor *compressor_;
+  } AppendBuffer;
+  
+  
   ObPartitionWriter() {}
 
   int init(const std::string& partition_directory) {
     int ret = OB_SUCCESS;
+    allocator_.set_tenant_id(MTL_ID());
     for (int64_t i=0; i<PARTITION_NUM; i++) {
       std::string tmp = partition_directory + "/" + std::to_string(i);
       common::ObString file_path{ tmp.c_str() };
-      if (OB_FAIL(appenders_[i].create(file_path))) {
+      if (OB_FAIL(buffers_[i].create(COMPRESS_BUFF_SIZE, &allocator_, file_path))) {
         LOG_WARN("fail to create partitoin file", KR(ret), K(file_path));
         break;
       }
@@ -272,32 +347,96 @@ public:
       return OB_ERR_UNEXPECTED;
     }
 
-    char buf[1024];
-    int64_t pos = 0;
-    int ret = datum_row->serialize(buf, 1024, pos);
-
     auto &lock = lock_[key % N_LOCK_SHARD];
     lock.lock();
-    appenders_[key].append(buf, pos, false);
+    int ret = buffers_[key].append_row(datum_row);
+    if (key == 1144) {
+      LOG_INFO("1144 append offset.", K(buffers_[key].offset_));
+    }
     lock.unlock();
     return ret;
   }
 
-  void close() {
-    for (auto &appender: appenders_)
-      appender.close();
+  int close() {
+    int ret = OB_SUCCESS;
+    for (auto &buffer: buffers_) {
+      if (OB_FAIL(buffer.close())) {
+        LOG_WARN("fail to close compress append buffer.", KR(ret));
+      }
+    }
+    return ret;
   }
 
 private:
+  AppendBuffer buffers_[PARTITION_NUM];
+  common::ObArenaAllocator allocator_;
   static OB_INLINE int64_t gen_key(int64_t pk) { return (pk - PK_MIN) / PK_SPAN; }
-
   common::ObSpinLock lock_[N_LOCK_SHARD];
-  BufferFileAppender appenders_[PARTITION_NUM];
 };
 
 // TODO: parallel optimize
 class ObPartitionReader
 {
+  typedef struct
+  {
+    int create(int64_t capacity, common::ObArenaAllocator* allocator) {
+      int ret = OB_SUCCESS;
+      allocator_ = allocator;
+      if (OB_ISNULL(compress_buff_ = static_cast<char*>(allocator_->alloc(capacity)))) {
+        LOG_WARN("fail to allocat in paertition reader.",KR(ret));
+      } else if (OB_FAIL(ObCompressorPool::get_instance().get_compressor(COMPRESS_TYPE, compressor_))) {
+        STORAGE_LOG(WARN, "Fail to get compressor, ", K(ret), K(COMPRESS_TYPE));
+      } else {
+        capacity_ = capacity;
+        begin_ = 0;
+        end_ = 0;
+      }
+      return ret;
+    }
+    int get_next_row(ObLoadDatumRow *datum_row) {
+      int ret = OB_SUCCESS;
+      int64_t size = 0;
+      if (begin_ > end_) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (begin_ == end_) {
+        ret = OB_ITER_END;
+      } else if (OB_FAIL(datum_row->deserialize(compress_buff_ + begin_, end_ - begin_, size))) {
+        LOG_WARN("datum row deserialize fail.", KR(ret));
+      } else {
+        begin_ += size;
+      }
+      return ret;
+    }
+    int get_next_buffer(const char *&buff, const char *end) {
+      int ret = OB_SUCCESS;
+      int64_t size = 0;
+      int64_t pos = 0;
+      int64_t compress_size = 0;
+      if (buff > end) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("Unexpected !", K(buff - end));
+      } else if (buff == end) {
+        ret = OB_ITER_END;
+      } else if (OB_FAIL(NS_::decode(buff, sizeof(size), pos, size))) {
+        LOG_WARN("decode size error.",K(buff), K(size));
+      } else if (buff + size + sizeof(size) > end) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected error.",K(buff), K(size), K(end));
+      } else if (OB_FAIL(compressor_->decompress(buff + sizeof(size), size, compress_buff_ + begin_, capacity_ - begin_, compress_size))) {
+        LOG_WARN("decompress error.", KR(ret));
+      } else {
+        end_ += compress_size;
+        buff += size + sizeof(size);
+      }
+      return ret;
+    }
+    common::ObArenaAllocator *allocator_;
+    char *compress_buff_;
+    int64_t capacity_;
+    int64_t begin_;
+    int64_t end_;
+    common::ObCompressor *compressor_;
+  } ReadCompressBuffer;
 public:
   ObPartitionReader() : allocator_(ObModIds::OB_SQL_LOAD_DATA) {}
 
@@ -314,6 +453,8 @@ public:
       LOG_WARN("fail to open next partition", KR(ret));
     } else if (OB_FAIL(read_next_buffer())) {
       LOG_WARN("fail to read next buffer", KR(ret));
+    } else if (OB_FAIL(compress_buffer_.create(DATA_BUFFER_SIZE, &allocator_))) {
+      LOG_WARN("fail to create a compress buffer.", KR(ret));
     }
     return ret;
   }
@@ -324,9 +465,6 @@ public:
     int64_t pos = 0;
     auto begin = buffer_.begin();
     auto end = buffer_.end();
-    if (begin >= end) {
-      return OB_END_OF_PARTITION;
-    }
     char *buff;
     if (OB_ISNULL(buff = static_cast<char *>(allocator_.alloc(sizeof(ObLoadDatumRow))))) {
       ret = common::OB_ALLOCATE_MEMORY_FAILED;
@@ -334,10 +472,24 @@ public:
     } else if (OB_ISNULL(datum_row = new (buff) ObLoadDatumRow(2,2))) {
       ret = common::OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("fail replace datumn_row.", K(ret));
-    } else if (OB_FAIL(datum_row->deserialize(begin, end - begin, pos))) {
-      LOG_WARN("fail to read next buffer with unexpected error", KR(ret));
-    } else {
-      buffer_.consume(pos);
+    } else if (OB_FAIL(compress_buffer_.get_next_row(datum_row))) {
+      if (OB_UNLIKELY(ret == OB_ITER_END)) {
+        ret = OB_SUCCESS;
+        const char *str = buffer_.begin();
+        if (begin == end) {
+          ret = OB_ITER_END;
+        } else if (begin > end) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(compress_buffer_.get_next_buffer(str, end))) {
+          LOG_WARN("fail to get next compress buffer.", KR(ret));
+        } else if (OB_FAIL(compress_buffer_.get_next_row(datum_row))) {
+          LOG_WARN("fail to get next row.", KR(ret));
+        } else {
+          buffer_.consume(str - begin);
+        }
+      } else {
+        LOG_WARN("fail to read next buffer with unexpected error", KR(ret));
+      }
     }
     return ret;
   }
@@ -382,6 +534,7 @@ private:
   std::string partition_directory_;
   int64_t partition_id_;
   int64_t capacity_;
+  ReadCompressBuffer compress_buffer_;
   ObLoadSequentialFileReader file_reader_;
   ObLoadDataBuffer buffer_;
 };
@@ -398,7 +551,7 @@ public:
 
   int get_res() const { return ret_.load(); }
   int32_t get_task() { return task_id_.fetch_add(1); }
-  void close() { partition_writer_.close(); }
+  int close() { return partition_writer_.close(); }
 
 private:
   ObLoadDataStmt *load_stmt_;
@@ -467,10 +620,11 @@ public:
     split_pool_->set_run_wrapper(MTL_CTX());
     split_pool_->start();
     split_pool_->wait();
-    split_pool_->close();
 
     int ret = OB_SUCCESS;
-    if (OB_FAIL(split_pool_->get_res())) {
+    if (OB_FAIL(split_pool_->close())) {
+      LOG_WARN("fail to close split pool.", KR(ret));
+    } else if (OB_FAIL(split_pool_->get_res())) {
       LOG_WARN("controller read err.", K(ret));
     }
     delete split_pool_;
