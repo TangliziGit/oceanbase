@@ -1031,9 +1031,6 @@ void ObSStableWriterThreadPool::run1()
       }
       break;
     }
-    if (task_id == 1144) {
-      LOG_INFO("-----");
-    }
     LOG_INFO("load task start.", K(ret), K(thread_id), K(task_id));
     ObLoadDatumRow *datum_row = nullptr;
     ObLoadSort load_sort;
@@ -1165,10 +1162,16 @@ int ObLoadDataDirect::do_load()
 {
   LOG_INFO("start load");
   int ret = OB_SUCCESS;
+  struct timeval tv;
+  gettimeofday(&tv,NULL);
+  int64_t stamp1 = tv.tv_sec * 1000000 + tv.tv_usec;
   sstable_writer_thread_pool_.set_thread_count(N_CPU);
   sstable_writer_thread_pool_.set_run_wrapper(MTL_CTX());
   sstable_writer_thread_pool_.start();
   sstable_writer_thread_pool_.wait();
+  gettimeofday(&tv,NULL);
+  int64_t stamp2 = tv.tv_sec * 1000000 + tv.tv_usec;
+  LOG_INFO("load data test time waste : stamp 3.", K(stamp2 - stamp1));
   if (OB_SUCC(sstable_writer_thread_pool_.get_res())) {
     if (OB_FAIL(sstable_writer_thread_pool_.close())) {
       LOG_WARN("fail to close sstable writer", KR(ret));

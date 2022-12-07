@@ -6,6 +6,7 @@
 
 #include <dirent.h>
 #include <unistd.h>
+#include <sys/time.h>
 #include <atomic>
 #include "lib/file/ob_file.h"
 #include "lib/timezone/ob_timezone_info.h"
@@ -22,16 +23,16 @@ static constexpr int64_t FILE_DATA_BUFFER_SIZE = (2LL << 20); // 2M
 static constexpr int64_t DATA_BUFFER_SIZE = (200LL << 20); // 200M
 static constexpr int64_t PK_MIN = 0;
 static constexpr int64_t PK_MAX = 300000000;
-static constexpr int64_t PK_SPAN = (1LL << 18); 
-static constexpr int64_t PK1_BITE = 16; 
-static constexpr int64_t PK2_BITE = 4; 
+static constexpr int64_t PK_SPAN = (1LL << 19); 
+static constexpr int64_t PK1_BITE = 19; 
+static constexpr int64_t PK2_BITE = 3; 
 static constexpr int64_t U_INT = 11; 
 static constexpr int64_t MASK = (1LL << U_INT) - 1; 
 static constexpr int64_t PARTITION_NUM = PK_MAX / PK_SPAN + 1 - PK_MIN / PK_SPAN;
 static const char * PARTITION_DIR = "./load-partition/";
 
 static constexpr int64_t TASK_SIZE = (128LL << 20); // 128M
-static constexpr int64_t COMPRESS_BUFF_SIZE = (1LL << 20); // 1M
+static constexpr int64_t COMPRESS_BUFF_SIZE = (4LL << 20); // 4M
 static constexpr int64_t MEM_BUFFER_SIZE = (1LL << 30); // 1G
 static constexpr int64_t SORT_BUFFER_SIZE = 4 * (1LL << 30); // 4G
 static constexpr int64_t N_CPU = 8;
@@ -251,7 +252,7 @@ private:
 class ObPartitionWriter
 {
 public:
-using BufferFileAppender = common::FileComponent::BufferFileAppender;
+using DirectFileAppender = common::FileComponent::DirectFileAppender;
   typedef struct
   {
     int create(int64_t capacity, common::ObArenaAllocator* allocator, common::ObString file_path) {
@@ -318,7 +319,7 @@ using BufferFileAppender = common::FileComponent::BufferFileAppender;
     int64_t compress_capacity_;
     int64_t offset_ = 0;
     int64_t tail_size_ = 512;
-    BufferFileAppender appender_;
+    DirectFileAppender appender_;
     common::ObCompressor *compressor_;
   } AppendBuffer;
   
@@ -616,17 +617,25 @@ public:
   }
 
   int split() {
+    struct timeval tv;
+    gettimeofday(&tv,NULL);
+    int64_t stamp1 = tv.tv_sec * 1000000 + tv.tv_usec;
     split_pool_->set_thread_count(N_CPU);
     split_pool_->set_run_wrapper(MTL_CTX());
     split_pool_->start();
     split_pool_->wait();
-
+    gettimeofday(&tv,NULL);
+    int64_t stamp2 = tv.tv_sec * 1000000 + tv.tv_usec;
+    LOG_INFO("load data test time waste : stamp 1.", K(stamp2 - stamp1));
     int ret = OB_SUCCESS;
     if (OB_FAIL(split_pool_->close())) {
       LOG_WARN("fail to close split pool.", KR(ret));
     } else if (OB_FAIL(split_pool_->get_res())) {
       LOG_WARN("controller read err.", K(ret));
     }
+    gettimeofday(&tv,NULL);
+    int64_t stamp3 = tv.tv_sec * 1000000 + tv.tv_usec;
+    LOG_INFO("load data test time waste : stamp 2.", K(stamp3 - stamp2));
     delete split_pool_;
     return ret;
   }
