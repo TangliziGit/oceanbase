@@ -8,6 +8,8 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <atomic>
+#include <libaio.h>
+#include <unistd.h>
 #include "lib/file/ob_file.h"
 #include "lib/timezone/ob_timezone_info.h"
 #include "sql/engine/cmd/ob_load_data_impl.h"
@@ -23,8 +25,8 @@ static constexpr int64_t FILE_DATA_BUFFER_SIZE = (2LL << 20); // 2M
 static constexpr int64_t DATA_BUFFER_SIZE = (200LL << 20); // 200M
 static constexpr int64_t PK_MIN = 0;
 static constexpr int64_t PK_MAX = 300000000;
-static constexpr int64_t PK_SPAN = (1LL << 19); 
-static constexpr int64_t PK1_BITE = 19; 
+static constexpr int64_t PK_SPAN = (1LL << 18);
+static constexpr int64_t PK1_BITE = 18;
 static constexpr int64_t PK2_BITE = 3; 
 static constexpr int64_t U_INT = 11; 
 static constexpr int64_t MASK = (1LL << U_INT) - 1; 
@@ -32,10 +34,10 @@ static constexpr int64_t PARTITION_NUM = PK_MAX / PK_SPAN + 1 - PK_MIN / PK_SPAN
 static const char * PARTITION_DIR = "./load-partition/";
 
 static constexpr int64_t TASK_SIZE = (128LL << 20); // 128M
-static constexpr int64_t COMPRESS_BUFF_SIZE = (4LL << 20); // 4M
+static constexpr int64_t COMPRESS_BUFF_SIZE = (2LL << 20); // 2M
 static constexpr int64_t MEM_BUFFER_SIZE = (1LL << 30); // 1G
 static constexpr int64_t SORT_BUFFER_SIZE = 4 * (1LL << 30); // 4G
-static constexpr int64_t N_CPU = 8;
+static constexpr int64_t N_CPU = 10;
 static constexpr int64_t N_LOCK_SHARD = PARTITION_NUM;
 
 static constexpr ObCompressorType COMPRESS_TYPE = ZSTD_1_3_8_COMPRESSOR;
@@ -110,6 +112,61 @@ private:
   common::ObFileReader file_reader_;
   int64_t offset_;
   bool is_read_end_;
+};
+
+class ObLoadAioAppender
+{
+public:
+  ObLoadAioAppender() {};
+  ~ObLoadAioAppender() {};
+  int create(const ObString &filepath) {
+    max_task_size_ = 10;
+    cur_task_size_ = 0;
+    offset_ = 0;
+    memset(&ctx_, 0, sizeof(ctx_));
+    if (io_setup(max_task_size_, &ctx_) != 0) {
+        return -1;
+    }
+    if ((fd_ = open(filepath.ptr(), O_CREAT | O_WRONLY, 0644)) < 0) {
+      return -2;
+    }
+    return 0;
+  }
+  int aio_close() {
+    struct io_event e[max_task_size_];
+    if (io_getevents(ctx_, cur_task_size_, max_task_size_, e, NULL) < 0) {
+      return -1;
+    }
+    close(fd_);
+    io_destroy(ctx_);
+    return 0;
+  }
+  int append(void *buff, int64_t size) {
+    struct iocb io,*p=&io;
+    struct io_event e, pre_event[max_task_size_];
+    struct timespec timeout;
+    int return_size = 0;
+    if (cur_task_size_ == max_task_size_) {
+      return_size = io_getevents(ctx_, 1, max_task_size_, pre_event, NULL);
+    } else {
+      return_size = io_getevents(ctx_, 0, max_task_size_, pre_event, NULL);
+    }
+    cur_task_size_ -= return_size;
+    io_prep_pwrite(&io, fd_, buff, size, offset_);
+    io.data = buff;
+    if (io_submit(ctx_, 1, &p) != 1) {
+        return -2;
+    }
+    offset_ += size;
+    cur_task_size_++;
+    return 0;
+  }
+private:
+  io_context_t ctx_;
+  int64_t max_task_size_;
+  int64_t cur_task_size_;
+  int64_t offset_;
+  int32_t fd_;
 };
 
 class ObLoadCSVPaser
@@ -265,14 +322,15 @@ using DirectFileAppender = common::FileComponent::DirectFileAppender;
         LOG_WARN("fail to get max overflow size.", KR(ret));
       } else if (OB_ISNULL(buff_ = static_cast<char*>(allocator_->alloc(capacity)))) {
         LOG_WARN("fail to allocat in paertition reader.",KR(ret));
-      } else if (OB_ISNULL(compress_buff_ = static_cast<char*>(allocator_->alloc(capacity + max_overflow_size + sizeof(int64_t))))) {
+      } else if (OB_ISNULL(compress_buff_ = static_cast<char*>(allocator_->alloc(capacity * 2 + max_overflow_size + sizeof(int64_t))))) {
         LOG_WARN("fail to allocat in paertition reader.",KR(ret));
       } else if (OB_FAIL(appender_.create(file_path))) {
         LOG_WARN("fail to create partitoin file", KR(ret), K(file_path));
       } else {
-        compress_capacity_ = capacity + max_overflow_size + sizeof(int64_t);
+        compress_capacity_ = capacity * 2 + max_overflow_size + sizeof(int64_t);
         capacity_ = capacity;
         offset_ = 0;
+        compress_offset_ = 0;
       }
       return ret;
     }
@@ -282,8 +340,10 @@ using DirectFileAppender = common::FileComponent::DirectFileAppender;
         LOG_WARN("datum row serialize fail.", KR(ret), K(offset_));
       } else if (capacity_ - offset_ > tail_size_) {
         
-      } else if (OB_FAIL(flush())) {
-        LOG_WARN("fail to flush compress block.", KR(ret));
+      } else if (OB_FAIL(compress())) {
+        LOG_WARN("fail to compress block.", KR(ret));
+      } else if (OB_FAIL(flush(false))) {
+        LOG_WARN("false to flush compress buffer.", KR(ret));
       } else {
         offset_ = 0;
       }
@@ -291,35 +351,77 @@ using DirectFileAppender = common::FileComponent::DirectFileAppender;
     }
     int close() {
       int ret = OB_SUCCESS;
-      if (offset_ == 0) {
-      } else if (OB_FAIL(flush())) {
-        LOG_WARN("append flash fail.", KR(ret));
+      if (offset_ != 0) {
+        if (OB_FAIL(compress())) {
+          LOG_WARN("compress error.", K(ret));
+        }
       }
-      appender_.close();
+      if (compress_offset_ != 0) {
+        if (OB_FAIL(flush(true))) {
+          LOG_WARN("append flush fail.", KR(ret));
+        }
+      }
+      if (OB_SUCC(ret)) {
+        if (OB_FAIL(appender_.aio_close())) {
+          LOG_WARN("appender close error!", K(ret));
+        }
+      }
       return ret;
     };
-    int flush() {
-      int ret = OB_SUCCESS;
-      int64_t size = 0;
-      int64_t count_pos = 0;
-      if (OB_FAIL(compressor_->compress(buff_, offset_, compress_buff_ + sizeof(size), compress_capacity_ - sizeof(size), size))) {
-        LOG_WARN("fail to compress tmp file block.", KR(ret));
-      } else if (OB_FAIL(NS_::encode(compress_buff_, sizeof(size), count_pos, size))) {
-        LOG_WARN("fail to seriealize size of block.", KR(ret));
-      } else if (OB_FAIL(appender_.append(compress_buff_, size + sizeof(size), false))) {
-        LOG_WARN("fail to append tmp file block.", KR(ret));
+    int flush(bool is_flush) {
+      int ret = 0;
+      int64_t flush_size = 0;
+      if (OB_UNLIKELY(is_flush)) {
+        flush_size = compress_offset_;
+        if (OB_FAIL(appender_.append(compress_buff_, flush_size))) {
+          LOG_WARN("fail to append tmp file block.", K(ret));
+        } else {
+          LOG_INFO("flush 1", K(flush_size), K(compress_offset_));
+        }
+      } else if (OB_UNLIKELY(sholud_flush())) {
+        flush_size = capacity_;
+        if (OB_FAIL(appender_.append(compress_buff_, flush_size))) {
+          LOG_WARN("fail to append tmp file block.", K(ret));
+        } else {
+          LOG_INFO("flush 2", K(flush_size), K(compress_offset_));
+        }
+      }
+      if (flush_size != 0) {
+        MEMCPY(compress_buff_, compress_buff_ + flush_size, compress_offset_ - flush_size);
+        compress_offset_ -= flush_size;
       }
       return ret;
     }
-    OB_INLINE bool sholud_flash() { return capacity_ - offset_ < tail_size_; }
+    OB_INLINE bool sholud_flush() { return compress_offset_ >= capacity_; }
+    OB_INLINE char* get_compress_begin() { return compress_buff_ + compress_offset_; }
+    OB_INLINE int64_t get_compress_remain_size() { return compress_capacity_ - compress_offset_; };
+    OB_INLINE void compress_consume(int size) { compress_offset_ += size; }
+    int compress() {
+      int ret = OB_SUCCESS;
+      int64_t size = 0;
+      int64_t count_pos = compress_offset_;
+      if (OB_FAIL(compressor_->compress(buff_, offset_, get_compress_begin() + sizeof(size), get_compress_remain_size() - sizeof(size), size))) {
+        LOG_WARN("fail to compress tmp file block.", KR(ret));
+      } else if (OB_FAIL(NS_::encode(compress_buff_, compress_capacity_, count_pos, size))) {
+        LOG_WARN("fail to seriealize size of block.", KR(ret));
+      } else {
+        compress_consume(sizeof(size) + size);
+      }
+      return ret;
+    }
     common::ObArenaAllocator *allocator_;
     char *buff_;
     char *compress_buff_;
     int64_t capacity_;
-    int64_t compress_capacity_;
+    
+    // datum row buffer
     int64_t offset_ = 0;
     int64_t tail_size_ = 512;
-    DirectFileAppender appender_;
+
+    // compress buffer
+    int64_t compress_capacity_;
+    int64_t compress_offset_;
+    ObLoadAioAppender appender_;
     common::ObCompressor *compressor_;
   } AppendBuffer;
   
