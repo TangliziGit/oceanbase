@@ -153,6 +153,9 @@ public:
       return_size = io_getevents(ctx_, 0, max_task_size_, pre_event, NULL);
     }
     cur_task_size_ -= return_size;
+    if (((uint64_t)buff) % 512 != 0) {
+      LOG_WARN("not alian in append.", K(buff));
+    }
     io_prep_pwrite(&io, fd_, buff, size, offset_);
     io.data = buff;
     if (io_submit(ctx_, 1, &p) != 1) {
@@ -187,7 +190,7 @@ public:
     if (io_setup(1, &ctx_) != 0) {
         return -1;
     }
-    if ((fd_ = open(filepath.ptr(), O_RDONLY, 0644)) < 0) {
+    if ((fd_ = open(filepath.ptr(), O_RDONLY | O_DIRECT, 0644)) < 0) {
       return -2;
     }
     struct stat file_stat;
@@ -195,6 +198,12 @@ public:
     max_size_ = file_stat.st_size;
     if (OB_ISNULL(buf_ = static_cast<char*>(allocator_.alloc(capacity_)))) {
       LOG_WARN("");
+    } else if (OB_ISNULL(read_buf_ = static_cast<char*>(allocator_.alloc(FILE_DATA_BUFFER_SIZE + 512)))) {
+      LOG_WARN("");
+    }
+    int64_t extral = ((uint64_t)read_buf_) % 512;
+    if (extral != 0) {
+      read_buf_ += (512 - extral);
     }
     return ret;
   }
@@ -209,11 +218,12 @@ public:
     if (io_getevents(ctx_, 1, 1, &pre_event, NULL) <= 0) {
       return -1;
     }
-    
-    int64_t return_size = pre_event.obj->u.c.nbytes;
+    int64_t return_size = last_read_size_;
+    //int64_t return_size = pre_event.res;
     if (return_size == 0) {
       return OB_ITER_END;
     }
+    MEMCPY(buf_ + end_, read_buf_, return_size);
     end_ += return_size;
     offset_ += return_size;
     int64_t read_size = buffer.get_remain_size();
@@ -223,10 +233,9 @@ public:
     MEMCPY(buf_, buf_ + read_size, end_ - read_size);
     end_ -= read_size;
 
-    struct iocb io_;
     struct iocb *p = &io_;
-    read_size = FILE_DATA_BUFFER_SIZE > (max_size_ - offset_) ? max_size_ - offset_ : FILE_DATA_BUFFER_SIZE;
-    io_prep_pread(&io_, fd_, buf_ + end_, read_size, offset_);
+    last_read_size_ = FILE_DATA_BUFFER_SIZE > (max_size_ - offset_) ? max_size_ - offset_ : FILE_DATA_BUFFER_SIZE;
+    io_prep_pread(&io_, fd_, read_buf_, FILE_DATA_BUFFER_SIZE, offset_);
     if (io_submit(ctx_, 1, &p) != 1) {
       return -2;
     }
@@ -234,13 +243,13 @@ public:
   }
   int set_offset_and_pread(int64_t offset) {
     offset_ = offset;
-    struct iocb io_;
+    
     struct iocb *p = &io_;
     if (max_size_ <= offset)  {
       return OB_ITER_END;
     }
-    int64_t read_size = FILE_DATA_BUFFER_SIZE > (max_size_ - offset_)? (max_size_ - offset_) : FILE_DATA_BUFFER_SIZE;
-    io_prep_pread(&io_, fd_, buf_, read_size, offset_);
+    last_read_size_ = FILE_DATA_BUFFER_SIZE > (max_size_ - offset_)? (max_size_ - offset_) : FILE_DATA_BUFFER_SIZE;
+    io_prep_pread(&io_, fd_, read_buf_, FILE_DATA_BUFFER_SIZE, offset_);
     if (io_submit(ctx_, 1, &p) != 1) {
       return -1;
     }
@@ -253,7 +262,10 @@ public:
 private:
   common::ObArenaAllocator allocator_;
   char *buf_;
+  char *read_buf_;
+  struct iocb io_;
   io_context_t ctx_;
+  int64_t last_read_size_;
   int64_t begin_;
   int64_t end_;
   int64_t offset_;
@@ -413,15 +425,20 @@ using DirectFileAppender = common::FileComponent::DirectFileAppender;
         LOG_WARN("fail to get max overflow size.", KR(ret));
       } else if (OB_ISNULL(buff_ = static_cast<char*>(allocator_->alloc(capacity)))) {
         LOG_WARN("fail to allocat in paertition reader.",KR(ret));
-      } else if (OB_ISNULL(compress_buff_ = static_cast<char*>(allocator_->alloc(capacity * 2 + max_overflow_size + sizeof(int64_t))))) {
+      } else if (OB_ISNULL(compress_buff_ = static_cast<char*>(allocator_->alloc(capacity * 3)))) {
         LOG_WARN("fail to allocat in paertition reader.",KR(ret));
       } else if (OB_FAIL(appender_.create(file_path))) {
         LOG_WARN("fail to create partitoin file", KR(ret), K(file_path));
       } else {
-        compress_capacity_ = capacity * 2 + max_overflow_size + sizeof(int64_t);
+        compress_capacity_ = capacity * 3 - 512;
         capacity_ = capacity;
         offset_ = 0;
         compress_offset_ = 0;
+        uint64_t extral = ((uint64_t)compress_buff_) % 512;
+        if (extral != 0) {
+          LOG_INFO("compress_buff_ not alian.", K(extral));
+          compress_buff_ += (512 - extral);
+        }
       }
       return ret;
     }
