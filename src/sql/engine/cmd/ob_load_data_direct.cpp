@@ -225,6 +225,9 @@ int ObLoadCSVPaser::get_next_row(ObLoadFileDataBuffer &buffer, const ObNewRow *&
     const char *str = buffer.begin();
     const char *end = buffer.end();
     int64_t nrows = 1;
+    if (*str == EOF) {
+      return OB_ITER_END;
+    }
     if (OB_FAIL(csv_parser_.scan(str, end, nrows, nullptr, nullptr, unused_row_handler_,
                                  err_records_, false))) {
       LOG_WARN("fail to scan buffer", KR(ret));
@@ -268,11 +271,7 @@ int ObLoadCSVPaser::get_next_row(ObLoadFileDataBuffer &buffer, const ObNewRow *&
  */
 
 ObLoadDatumRow::ObLoadDatumRow()
-  : capacity_(0), count_(0), rowkey_column_num_(0),extra_column_num_(0),datums_(nullptr)
-{
-}
-ObLoadDatumRow::ObLoadDatumRow(int64_t rowkey_column_num, int64_t extra_column_num)
-  : capacity_(0), count_(0), rowkey_column_num_(rowkey_column_num),extra_column_num_(extra_column_num),datums_(nullptr)
+  : capacity_(0), count_(0), datums_(nullptr)
 {
 }
 
@@ -381,19 +380,11 @@ OB_DEF_DESERIALIZE(ObLoadDatumRow)
     if (OB_UNLIKELY(count <= 0)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected count", K(count));
-    } else if (count > capacity_ && OB_FAIL(init(count + extra_column_num_))) {
+    } else if (count > capacity_ && OB_FAIL(init(count))) {
       LOG_WARN("fail to init", KR(ret));
     } else {
-      for (int64_t i = 0; OB_SUCC(ret) && i < (count); ++i) {       
-        if (i < rowkey_column_num_) {
-          OB_UNIS_DECODE(datums_[i]);
-        } else {
-          OB_UNIS_DECODE(datums_[i + extra_column_num_]);
-        }                             
-      }
-      datums_[rowkey_column_num_].set_int(-1); // fill trans_version
-      datums_[rowkey_column_num_ + 1].set_int(0); // fill sql_no
-      count_ = count + extra_column_num_;
+      OB_UNIS_DECODE_ARRAY(datums_, count);
+      count_ = count;
     }
   }
   return ret;
@@ -762,18 +753,24 @@ int ObLoadSSTableWriter::append_row(const int index, const ObLoadDatumRow &datum
   } else if (OB_UNLIKELY(is_closed_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected closed external sort", KR(ret));
-  } else if (OB_UNLIKELY(!datum_row.is_valid() || datum_row.count_ != column_count_ + extra_rowkey_column_num_)) {
+  } else if (OB_UNLIKELY(!datum_row.is_valid() || datum_row.count_ != column_count_)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid args", KR(ret), K(datum_row), K(column_count_));
   } else {
-    /*for (int64_t i = 0; i < column_count_; ++i) {
+    for (int64_t i = 0; i < column_count_; ++i) {
       if (i < rowkey_column_num_) {
         datum_rows_[index].storage_datums_[i] = datum_row.datums_[i];
       } else {
         datum_rows_[index].storage_datums_[i + extra_rowkey_column_num_] = datum_row.datums_[i];
       }
-    }*/
-    datum_rows_[index].storage_datums_ = datum_row.datums_;
+    }
+    /*MEMCPY(datum_rows_[index].storage_datums_, datum_row.datums_, sizeof(ObStorageDatum) * rowkey_column_num_);
+    MEMCPY(datum_rows_[index].storage_datums_ + sizeof(ObStorageDatum) * (rowkey_column_num_ + extra_rowkey_column_num_), 
+            datum_row.datums_ + sizeof(ObStorageDatum) * rowkey_column_num_, 
+            sizeof(ObStorageDatum) * (column_count_ - rowkey_column_num_));*/
+    // int64_t pk1 = datum_row.datums_[0].get_int();
+    // int64_t pk2 = datum_row.datums_[1].get_int();
+    // LOG_INFO("append element: ", K(pk1), K(pk2), K(index));
     if (OB_FAIL(macro_block_writers_[index].append_row(datum_rows_[index]))) {
       int64_t pk1 = datum_row.datums_[0].get_int();
       int64_t pk2 = datum_row.datums_[1].get_int();
@@ -907,17 +904,29 @@ void ObLoadDataSplitThreadPool::run1()
   auto &datum_row_allocator = ObLoadDatumRowAllocator::get_allocator();
   datum_row_allocator.set_tenant_id(MTL_ID());
   LOG_INFO("data split start" , K(thread_id), K(MTL_ID()));
-
+  ObLoadAioReader file_reader;
   int ret = OB_SUCCESS;
+  if (OB_FAIL(file_reader.aio_open(load_args.full_file_path_))) {
+    LOG_WARN("fail to open aio file reader.", K(load_args.full_file_path_));
+  }
+  ret_.store(ret);
   int all_size = 0;
   while (ret_.load() == OB_SUCCESS) {
     int32_t task_id = get_task();
     ObLoadCSVPaser csv_parser;
     ObLoadFileDataBuffer buffer;
     ObLoadRowCaster row_caster;
-
+    file_reader.reset();
+    ;
     // init buffer
-    if (OB_FAIL(buffer.create(FILE_DATA_BUFFER_SIZE, task_id))) {
+    if (OB_FAIL(file_reader.set_offset_and_pread(task_id * TASK_SIZE))) {
+      if (OB_UNLIKELY(ret == OB_ITER_END)) {
+        ret = OB_SUCCESS;
+        break;
+      } else {
+        LOG_WARN("fail to set offset for file reader.", KR(ret));
+      }
+    } else if (OB_FAIL(buffer.create(FILE_DATA_BUFFER_SIZE, task_id))) {
       LOG_WARN("fail to create buffer", KR(ret));
     }
     // TODO: unnecessary initialization
@@ -940,7 +949,7 @@ void ObLoadDataSplitThreadPool::run1()
       while (OB_SUCC(ret)) {
         if (OB_FAIL(buffer.squash())) {
           LOG_WARN("fail to squash buffer", KR(ret));
-        } else if (OB_FAIL(file_reader_.read_next_buffer(buffer, buffer.get_offset()))) {
+        } else if (OB_FAIL(file_reader.read_next_buffer(buffer))) {
           if (OB_UNLIKELY(OB_ITER_END == ret)) {
             if (OB_UNLIKELY(!buffer.empty())) {
               ret = OB_ERR_UNEXPECTED;
@@ -1003,6 +1012,7 @@ void ObLoadDataSplitThreadPool::run1()
     }
   }
 
+  file_reader.aio_close();
   datum_row_allocator.reset();
   if (OB_FAIL(ret)) {
     ret_.store(ret);

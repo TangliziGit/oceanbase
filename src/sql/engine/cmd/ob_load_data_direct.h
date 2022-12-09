@@ -7,6 +7,7 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <sys/stat.h>
 #include <atomic>
 #include <libaio.h>
 #include <unistd.h>
@@ -37,7 +38,7 @@ static constexpr int64_t TASK_SIZE = (128LL << 20); // 128M
 static constexpr int64_t COMPRESS_BUFF_SIZE = (2LL << 20); // 2M
 static constexpr int64_t MEM_BUFFER_SIZE = (1LL << 30); // 1G
 static constexpr int64_t SORT_BUFFER_SIZE = 4 * (1LL << 30); // 4G
-static constexpr int64_t N_CPU = 10;
+static constexpr int64_t N_CPU = 8;
 static constexpr int64_t N_LOCK_SHARD = PARTITION_NUM;
 
 static constexpr ObCompressorType COMPRESS_TYPE = ZSTD_1_3_8_COMPRESSOR;
@@ -127,7 +128,7 @@ public:
     if (io_setup(max_task_size_, &ctx_) != 0) {
         return -1;
     }
-    if ((fd_ = open(filepath.ptr(), O_CREAT | O_WRONLY, 0644)) < 0) {
+    if ((fd_ = open(filepath.ptr(), O_CREAT | O_WRONLY | O_DIRECT, 0644)) < 0) {
       return -2;
     }
     return 0;
@@ -166,6 +167,99 @@ private:
   int64_t max_task_size_;
   int64_t cur_task_size_;
   int64_t offset_;
+  int32_t fd_;
+};
+
+class ObLoadAioReader 
+{
+public:
+  ObLoadAioReader() {}
+  ~ObLoadAioReader() {}
+  int aio_open(const ObString &filepath) {
+    allocator_.set_tenant_id(MTL_ID());
+    capacity_ = FILE_DATA_BUFFER_SIZE * 2;
+    offset_ = 0;
+    begin_ = 0;
+    end_ = 0;
+    is_iter_end_ = false;
+    int ret = OB_SUCCESS;
+    memset(&ctx_, 0, sizeof(ctx_));
+    if (io_setup(1, &ctx_) != 0) {
+        return -1;
+    }
+    if ((fd_ = open(filepath.ptr(), O_RDONLY, 0644)) < 0) {
+      return -2;
+    }
+    struct stat file_stat;
+    stat(filepath.ptr(), &file_stat);
+    max_size_ = file_stat.st_size;
+    if (OB_ISNULL(buf_ = static_cast<char*>(allocator_.alloc(capacity_)))) {
+      LOG_WARN("");
+    }
+    return ret;
+  }
+  void reset() {
+    begin_ = 0;
+    end_ = 0;
+    is_iter_end_ = false;
+  }
+  int read_next_buffer(ObLoadDataBuffer &buffer) {
+    struct io_event pre_event;
+    
+    if (io_getevents(ctx_, 1, 1, &pre_event, NULL) <= 0) {
+      return -1;
+    }
+    
+    int64_t return_size = pre_event.obj->u.c.nbytes;
+    if (return_size == 0) {
+      return OB_ITER_END;
+    }
+    end_ += return_size;
+    offset_ += return_size;
+    int64_t read_size = buffer.get_remain_size();
+    read_size = read_size > end_ ? end_ : read_size;  
+    MEMCPY(buffer.end(), buf_, read_size);
+    buffer.produce(read_size);
+    MEMCPY(buf_, buf_ + read_size, end_ - read_size);
+    end_ -= read_size;
+
+    struct iocb io_;
+    struct iocb *p = &io_;
+    read_size = FILE_DATA_BUFFER_SIZE > (max_size_ - offset_) ? max_size_ - offset_ : FILE_DATA_BUFFER_SIZE;
+    io_prep_pread(&io_, fd_, buf_ + end_, read_size, offset_);
+    if (io_submit(ctx_, 1, &p) != 1) {
+      return -2;
+    }
+    return 0;
+  }
+  int set_offset_and_pread(int64_t offset) {
+    offset_ = offset;
+    struct iocb io_;
+    struct iocb *p = &io_;
+    if (max_size_ <= offset)  {
+      return OB_ITER_END;
+    }
+    int64_t read_size = FILE_DATA_BUFFER_SIZE > (max_size_ - offset_)? (max_size_ - offset_) : FILE_DATA_BUFFER_SIZE;
+    io_prep_pread(&io_, fd_, buf_, read_size, offset_);
+    if (io_submit(ctx_, 1, &p) != 1) {
+      return -1;
+    }
+    return 0;
+  }
+  void aio_close() {
+    close(fd_);
+    io_destroy(ctx_);
+  } 
+private:
+  common::ObArenaAllocator allocator_;
+  char *buf_;
+  io_context_t ctx_;
+  int64_t begin_;
+  int64_t end_;
+  int64_t offset_;
+  int64_t max_size_;
+  int64_t capacity_;
+  bool is_iter_end_;
   int32_t fd_;
 };
 
@@ -211,7 +305,6 @@ class ObLoadDatumRow
   OB_UNIS_VERSION(1);
 public:
   ObLoadDatumRow();
-  ObLoadDatumRow(int64_t rowkey_column_num, int64_t extra_column_num);
   ~ObLoadDatumRow();
   void reset();
   int init(int64_t capacity);
@@ -224,8 +317,6 @@ public:
   // common::ObArenaAllocator allocator_;
   int64_t capacity_;
   int64_t count_;
-  int64_t rowkey_column_num_;
-  int64_t extra_column_num_;
   blocksstable::ObStorageDatum *datums_;
 };
 
@@ -572,7 +663,7 @@ public:
     if (OB_ISNULL(buff = static_cast<char *>(allocator_.alloc(sizeof(ObLoadDatumRow))))) {
       ret = common::OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("fail to alloc memery.", K(ret));
-    } else if (OB_ISNULL(datum_row = new (buff) ObLoadDatumRow(2,2))) {
+    } else if (OB_ISNULL(datum_row = new (buff) ObLoadDatumRow())) {
       ret = common::OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("fail replace datumn_row.", K(ret));
     } else if (OB_FAIL(compress_buffer_.get_next_row(datum_row))) {
