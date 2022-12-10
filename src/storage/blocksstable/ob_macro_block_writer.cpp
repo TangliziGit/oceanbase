@@ -119,7 +119,6 @@ int ObMicroBlockBufferHelper::check_micro_block(
     const ObMicroBlockDesc &micro_desc)
 {
   int ret = OB_SUCCESS;
-  return ret;
   const char *decomp_buf = nullptr;
   int64_t real_decomp_size = 0;
   if (MICRO_BLOCK_MERGE_VERIFY_LEVEL::ENCODING == micro_block_merge_verify_level_) {

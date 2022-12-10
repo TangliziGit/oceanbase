@@ -22,7 +22,7 @@
 #include "common/ob_clock_generator.h"
 
 static constexpr int64_t FILE_DATA_BUFFER_SIZE = (2LL << 20); // 2M
-static constexpr int64_t DATA_BUFFER_SIZE = (200LL << 20); // 200M
+static constexpr int64_t DATA_BUFFER_SIZE = (100LL << 20); // 200M
 static constexpr int64_t PK_MIN = 0;
 static constexpr int64_t PK_MAX = 300000000;
 static constexpr int64_t PK_SPAN = (1LL << 18);
@@ -37,7 +37,7 @@ static constexpr int64_t TASK_SIZE = (128LL << 20); // 128M
 static constexpr int64_t COMPRESS_BUFF_SIZE = (2LL << 20); // 2M
 static constexpr int64_t MEM_BUFFER_SIZE = (1LL << 30); // 1G
 static constexpr int64_t SORT_BUFFER_SIZE = 4 * (1LL << 30); // 4G
-static constexpr int64_t N_CPU = 10;
+static constexpr int64_t N_CPU = 16;
 static constexpr int64_t N_LOCK_SHARD = PARTITION_NUM;
 
 static constexpr ObCompressorType COMPRESS_TYPE = ZSTD_1_3_8_COMPRESSOR;
