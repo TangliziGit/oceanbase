@@ -23,22 +23,22 @@
 #include "common/ob_clock_generator.h"
 
 static constexpr int64_t FILE_DATA_BUFFER_SIZE = (2LL << 20); // 2M
-static constexpr int64_t DATA_BUFFER_SIZE = (200LL << 20); // 200M
+static constexpr int64_t DATA_BUFFER_SIZE = (100LL << 20); // 100M
 static constexpr int64_t PK_MIN = 0;
 static constexpr int64_t PK_MAX = 300000000;
 static constexpr int64_t PK_SPAN = (1LL << 18);
 static constexpr int64_t PK1_BITE = 18;
 static constexpr int64_t PK2_BITE = 3; 
-static constexpr int64_t U_INT = 11; 
+static constexpr int64_t U_INT = 11;
 static constexpr int64_t MASK = (1LL << U_INT) - 1; 
 static constexpr int64_t PARTITION_NUM = PK_MAX / PK_SPAN + 1 - PK_MIN / PK_SPAN;
 static const char * PARTITION_DIR = "./load-partition/";
 
 static constexpr int64_t TASK_SIZE = (128LL << 20); // 128M
-static constexpr int64_t COMPRESS_BUFF_SIZE = (2LL << 20); // 2M
+static constexpr int64_t COMPRESS_BUFF_SIZE = (1LL << 20); // 1M
 static constexpr int64_t MEM_BUFFER_SIZE = (1LL << 30); // 1G
 static constexpr int64_t SORT_BUFFER_SIZE = 4 * (1LL << 30); // 4G
-static constexpr int64_t N_CPU = 8;
+static constexpr int64_t N_CPU = 16;
 static constexpr int64_t N_LOCK_SHARD = PARTITION_NUM;
 
 static constexpr ObCompressorType COMPRESS_TYPE = ZSTD_1_3_8_COMPRESSOR;
@@ -121,14 +121,14 @@ public:
   ObLoadAioAppender() {};
   ~ObLoadAioAppender() {};
   int create(const ObString &filepath) {
-    max_task_size_ = 10;
+    max_task_size_ = 1;
     cur_task_size_ = 0;
     offset_ = 0;
     memset(&ctx_, 0, sizeof(ctx_));
-    if (io_setup(max_task_size_, &ctx_) != 0) {
+    if (io_setup(128, &ctx_) != 0) {
         return -1;
     }
-    if ((fd_ = open(filepath.ptr(), O_CREAT | O_WRONLY | O_DIRECT, 0644)) < 0) {
+    if ((fd_ = open(filepath.ptr(), O_CREAT | O_WRONLY, 0644)) < 0) {
       return -2;
     }
     return 0;
@@ -147,17 +147,26 @@ public:
     struct io_event e, pre_event[max_task_size_];
     struct timespec timeout;
     int return_size = 0;
+    struct timeval tv;
+    gettimeofday(&tv,NULL);
+    int64_t stamp1 = tv.tv_sec * 1000000 + tv.tv_usec;
     if (cur_task_size_ == max_task_size_) {
       return_size = io_getevents(ctx_, 1, max_task_size_, pre_event, NULL);
     } else {
       return_size = io_getevents(ctx_, 0, max_task_size_, pre_event, NULL);
     }
+    gettimeofday(&tv,NULL);
+    int64_t stamp2 = tv.tv_sec * 1000000 + tv.tv_usec;
+    LOG_INFO("write waite time.", K(stamp2 - stamp1), K(cur_task_size_), K(return_size));
     cur_task_size_ -= return_size;
     io_prep_pwrite(&io, fd_, buff, size, offset_);
     io.data = buff;
     if (io_submit(ctx_, 1, &p) != 1) {
         return -2;
     }
+    gettimeofday(&tv,NULL);
+    int64_t stamp3 = tv.tv_sec * 1000000 + tv.tv_usec;
+    LOG_INFO("write submite waite time.", K(stamp3 - stamp2));
     offset_ += size;
     cur_task_size_++;
     return 0;
@@ -196,6 +205,11 @@ public:
     if (OB_ISNULL(buf_ = static_cast<char*>(allocator_.alloc(capacity_)))) {
       LOG_WARN("");
     }
+    uint64_t extral = ((uint64_t)buf_) % 512;
+    if (extral != 0) {
+      buf_ += (512 - extral);
+      capacity_ -= 512;
+    }
     return ret;
   }
   void reset() {
@@ -205,12 +219,19 @@ public:
   }
   int read_next_buffer(ObLoadDataBuffer &buffer) {
     struct io_event pre_event;
+    struct timeval tv;
+    gettimeofday(&tv,NULL);
+    int64_t stamp1 = tv.tv_sec * 1000000 + tv.tv_usec;
     
     if (io_getevents(ctx_, 1, 1, &pre_event, NULL) <= 0) {
       return -1;
     }
+
+    gettimeofday(&tv, NULL);
+    int64_t stamp2 = tv.tv_sec * 1000000 + tv.tv_usec;
+    LOG_INFO("aio read waste time.", K(pre_event.res), K(pre_event.res2), K(stamp2 - stamp1));
     
-    int64_t return_size = pre_event.obj->u.c.nbytes;
+    int64_t return_size = last_read_size_;
     if (return_size == 0) {
       return OB_ITER_END;
     }
@@ -223,24 +244,31 @@ public:
     MEMCPY(buf_, buf_ + read_size, end_ - read_size);
     end_ -= read_size;
 
-    struct iocb io_;
+    gettimeofday(&tv,NULL);
+    int64_t stamp3 = tv.tv_sec * 1000000 + tv.tv_usec;
     struct iocb *p = &io_;
-    read_size = FILE_DATA_BUFFER_SIZE > (max_size_ - offset_) ? max_size_ - offset_ : FILE_DATA_BUFFER_SIZE;
-    io_prep_pread(&io_, fd_, buf_ + end_, read_size, offset_);
+    last_read_size_ = FILE_DATA_BUFFER_SIZE > (max_size_ - offset_) ? max_size_ - offset_ : FILE_DATA_BUFFER_SIZE;
+
+    if ((last_read_size_ % 512 != 0) || (((uint64_t)buf_ + end_) % 512 != 0)) {
+      LOG_WARN("not ali.", K(read_size), K(end_));
+    }
+    io_prep_pread(&io_, fd_, buf_ + end_, FILE_DATA_BUFFER_SIZE, offset_);
     if (io_submit(ctx_, 1, &p) != 1) {
       return -2;
     }
+    gettimeofday(&tv,NULL);
+    int64_t stamp4 = tv.tv_sec * 1000000 + tv.tv_usec;
+    LOG_INFO("read submite waste time.", K(stamp4 - stamp3));
     return 0;
   }
   int set_offset_and_pread(int64_t offset) {
     offset_ = offset;
-    struct iocb io_;
     struct iocb *p = &io_;
     if (max_size_ <= offset)  {
       return OB_ITER_END;
     }
-    int64_t read_size = FILE_DATA_BUFFER_SIZE > (max_size_ - offset_)? (max_size_ - offset_) : FILE_DATA_BUFFER_SIZE;
-    io_prep_pread(&io_, fd_, buf_, read_size, offset_);
+    last_read_size_ = FILE_DATA_BUFFER_SIZE > (max_size_ - offset_)? (max_size_ - offset_) : FILE_DATA_BUFFER_SIZE;
+    io_prep_pread(&io_, fd_, buf_, FILE_DATA_BUFFER_SIZE, offset_);
     if (io_submit(ctx_, 1, &p) != 1) {
       return -1;
     }
@@ -253,7 +281,9 @@ public:
 private:
   common::ObArenaAllocator allocator_;
   char *buf_;
+  struct iocb io_;
   io_context_t ctx_;
+  int64_t last_read_size_;
   int64_t begin_;
   int64_t end_;
   int64_t offset_;
