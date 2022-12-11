@@ -1165,7 +1165,7 @@ int ObLoadDataDirect::do_load()
   struct timeval tv;
   gettimeofday(&tv,NULL);
   int64_t stamp1 = tv.tv_sec * 1000000 + tv.tv_usec;
-  sstable_writer_thread_pool_.set_thread_count(N_CPU);
+  sstable_writer_thread_pool_.set_thread_count(8);
   sstable_writer_thread_pool_.set_run_wrapper(MTL_CTX());
   sstable_writer_thread_pool_.start();
   sstable_writer_thread_pool_.wait();

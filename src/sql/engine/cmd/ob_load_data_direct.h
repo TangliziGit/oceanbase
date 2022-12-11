@@ -40,7 +40,7 @@ static constexpr int64_t SORT_BUFFER_SIZE = 4 * (1LL << 30); // 4G
 static constexpr int64_t N_CPU = 16;
 static constexpr int64_t N_LOCK_SHARD = PARTITION_NUM;
 
-static constexpr ObCompressorType COMPRESS_TYPE = ZSTD_1_3_8_COMPRESSOR;
+static constexpr ObCompressorType COMPRESS_TYPE = LZ4_191_COMPRESSOR;//ZSTD_1_3_8_COMPRESSOR;
 // additional error code `OB_END_OF_PARTITION`,
 // which means this partition has been read through,
 // and next partition file is needed to be open.
@@ -453,9 +453,6 @@ using DirectFileAppender = common::FileComponent::DirectFileAppender;
     auto &lock = lock_[key % N_LOCK_SHARD];
     lock.lock();
     int ret = buffers_[key].append_row(datum_row);
-    if (key == 1144) {
-      LOG_INFO("1144 append offset.", K(buffers_[key].offset_));
-    }
     lock.unlock();
     return ret;
   }
